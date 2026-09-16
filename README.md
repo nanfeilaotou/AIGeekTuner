@@ -13,7 +13,7 @@
 [![.NET](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
 [![WPF](https://img.shields.io/badge/UI-WPF-0078D4?style=flat-square&logo=windows&logoColor=white)](https://learn.microsoft.com/dotnet/desktop/wpf/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows11&logoColor=white)](https://www.microsoft.com/windows/)
-[![Tests](https://img.shields.io/badge/tests-909%20passed-22c55e?style=flat-square)](#tests--quality-gates)
+[![Tests](https://img.shields.io/badge/tests-913%20passed-22c55e?style=flat-square)](#tests--quality-gates)
 [![Warnings](https://img.shields.io/badge/build-0%20warnings-22c55e?style=flat-square)](#tests--quality-gates)
 [![Stars](https://img.shields.io/github/stars/nanfeilaotou/AIGeekTuner?style=flat-square&logo=github)](https://github.com/nanfeilaotou/AIGeekTuner/stargazers)
 [![Downloads](https://img.shields.io/github/downloads/nanfeilaotou/AIGeekTuner/total?style=flat-square&logo=github)](https://github.com/nanfeilaotou/AIGeekTuner/releases)
@@ -351,6 +351,24 @@ Session AI 与页面生命周期解耦采用明确的 ownership / cancellation �
 
 GPT-SoVITS 通过 API v2 接入；语音层属于 presentation 能力，不参与 Fact Grounding，也不是 Evidence ZIP 的必要诊断证据。
 
+### GPT-SoVITS Configuration
+
+GPT-SoVITS 是完全可选功能。可以在 `Settings` 中配置：
+
+- Endpoint
+- Reference Audio Path
+- Reference Audio Transcript
+- Reference Audio Language（`zh` / `ja` / `en`）
+- Speed Factor
+
+`Reference Audio Path` 必须是 GPT-SoVITS 服务进程能够访问的路径。本机运行服务时可以填写本机路径；如果服务运行在另一台电脑上，该路径必须对远端 GPT-SoVITS 服务可见，AIGeekTuner 不会自动上传本机文件。
+
+`PromptLang` 表示参考音频语言；当前 Spoken Summary 正文固定使用 `text_lang = zh` 合成，不表示正文支持多语言 TTS。
+
+fresh install 默认不会主动切换 GPT / SoVITS 权重，而是使用 GPT-SoVITS 服务当前已经加载的模型。成功生成的 `voice.wav` 按 Session / analysis identity 持久缓存，页面切换和程序重启后可以复用；删除 Session 时对应缓存会被清理。
+
+GPT-SoVITS 配置失败或服务离线，不影响 Session 文本分析、Session 数据保存或 Evidence。
+
 ## Export, Backup & Portability
 
 ### Session Export
@@ -584,9 +602,9 @@ dotnet test
 dotnet test -c Release
 ```
 
-当前 v2.0 Release Candidate：
+当前 v2.0.0 发布质量门：
 
-- **909 / 909 tests passed**
+- **913 / 913 tests passed**
 - **Debug: 0 warnings / 0 errors**
 - **Release: 0 warnings / 0 errors**
 - **Release x64 full test gate: PASS**

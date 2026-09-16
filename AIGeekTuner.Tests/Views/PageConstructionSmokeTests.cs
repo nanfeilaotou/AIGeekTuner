@@ -292,7 +292,7 @@ public class PageConstructionSmokeTests
                 Assert.Same(page.TryFindResource("ModelComboStyle"), langCombo.Style); // 主题化，非原生白框
                 var langItem = Assert.IsType<ComboBoxItem>(langCombo.SelectedItem);
                 Assert.Equal(settingsViewModel.VoicePromptLang, langItem.Tag); // 当前值可见且映射不变
-                Assert.Equal("日语（ja）", langItem.Content);
+                Assert.Equal("中文（zh）", langItem.Content);
 
                 // 按真实用户路径切换：从下拉选择（VoicePromptLang 为旧式单向属性，UI→VM）。
                 langCombo.SelectedValue = "en";

@@ -49,6 +49,7 @@ public class SettingsAutoSaveTests : IDisposable
     {
         var viewModel = CreateViewModel();
 
+        viewModel.VoiceReferenceAudioPath = "C:\\TestData\\reference.wav";
         viewModel.VoiceEnabled = true;
         await viewModel.CommitAutoSaveAsync();
 

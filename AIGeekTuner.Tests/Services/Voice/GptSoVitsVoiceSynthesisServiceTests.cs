@@ -94,6 +94,28 @@ namespace AIGeekTuner.Tests.Services.Voice
         }
 
         [Fact]
+        public async Task EmptyWeights_PostsToTtsWithoutSwitchingModels()
+        {
+            var (service, handler) = Create();
+            handler.Responder = _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(Wav),
+            };
+            var config = Config with
+            {
+                GptModelPath = string.Empty,
+                SovitsModelPath = string.Empty,
+            };
+
+            var result = await service.SynthesizeAsync("使用当前模型", config, CancellationToken.None);
+
+            Assert.True(result.Succeeded);
+            Assert.DoesNotContain(handler.Requests, request => request.Url.Contains("/set_gpt_weights"));
+            Assert.DoesNotContain(handler.Requests, request => request.Url.Contains("/set_sovits_weights"));
+            Assert.Single(handler.Requests, request => request.Url.EndsWith("/tts"));
+        }
+
+        [Fact]
         public async Task WeightEndpoints_CarryEscapedPaths()
         {
             var (service, handler) = Create();

@@ -20,6 +20,14 @@
 | AI 诊断 | 已保存并激活的 Ollama Native 或 OpenAI-compatible Provider，以及可用模型 | 应用仍可浏览本地功能；诊断/Session AI 显示未配置、连接失败、鉴权失败、模型不可用或超时 |
 | Session 语音 | 可选 GPT-SoVITS HTTP 服务、有效参考音频路径和可用的 Windows 音频输出设备/权限 | 文本分析与 Session 持久化不受影响；语音生成或播放显示失败/未配置，可重试 |
 
+### GPT-SoVITS 配置
+
+GPT-SoVITS 是可选依赖。fresh install 不包含开发者参考音频路径、GPT 权重路径或 SoVITS 权重路径；默认不会主动切换权重，而是使用 GPT-SoVITS 服务当前已经加载的模型。
+
+可在 Settings 中配置 Endpoint、Reference Audio Path、Reference Audio Transcript、Reference Audio Language（`zh` / `ja` / `en`）和 Speed Factor。Reference Audio Path 必须对 GPT-SoVITS 服务进程可见：服务在本机运行时可以填写本机路径，服务在另一台电脑上运行时不能假设 AIGeekTuner 本机路径会自动上传。
+
+`PromptLang` 表示参考音频语言；Spoken Summary 正文当前固定使用 `text_lang = zh` 合成。成功生成的 `voice.wav` 按 Session / analysis identity 持久缓存，页面切换和程序重启后可以复用，删除 Session 时对应缓存会被清理。GPT-SoVITS 配置失败或服务离线不影响 Session 文本分析、Session 持久化或 Evidence。
+
 PawnIO 不是应用启动前置条件。它缺失时，LibreHardwareMonitor 仍按其自身支持范围工作，但需要低层访问的传感器可能不可见。不要通过关闭驱动签名、Defender、SmartScreen、内存完整性或其它 Windows 安全能力来换取更多传感器数据。
 
 ### Intel GPU / LibreHardwareMonitor 限制

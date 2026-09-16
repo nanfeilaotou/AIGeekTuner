@@ -40,7 +40,7 @@ public sealed class PortableVoiceSettings
 
     public string PromptText { get; init; } = string.Empty;
 
-    public string PromptLang { get; init; } = "ja";
+    public string PromptLang { get; init; } = "zh";
 
     public double SpeedFactor { get; init; } = 1.0;
 

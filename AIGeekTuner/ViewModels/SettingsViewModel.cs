@@ -57,7 +57,7 @@ namespace AIGeekTuner.ViewModels
         private string _voiceEndpoint = string.Empty;
         private string _voiceReferenceAudioPath = string.Empty;
         private string _voicePromptText = string.Empty;
-        private string _voicePromptLang = "ja";
+        private string _voicePromptLang = "zh";
         private string _voiceSpeedFactorText = "1.0";
 
         private bool _isSaving;
