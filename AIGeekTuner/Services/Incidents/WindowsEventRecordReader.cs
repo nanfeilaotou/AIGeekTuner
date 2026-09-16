@@ -24,24 +24,52 @@ namespace AIGeekTuner.Services.Incidents
                 throw new ArgumentOutOfRangeException(nameof(maxResults));
             }
 
-            return Task.Run<IReadOnlyList<RawWindowsEvent>>(
-                () => ReadCore(channel, startUtc, endUtc, maxResults, cancellationToken),
-                cancellationToken);
+            return ReadDetailedAsync(
+                channel, startUtc, endUtc, maxResults, [], cancellationToken)
+                .ContinueWith(
+                    task => (IReadOnlyList<RawWindowsEvent>)task.GetAwaiter().GetResult().Events,
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
         }
 
-        private static List<RawWindowsEvent> ReadCore(
+        public Task<WindowsEventReadResult> ReadDetailedAsync(
             string channel,
             DateTimeOffset startUtc,
             DateTimeOffset endUtc,
             int maxResults,
+            IReadOnlyList<WindowsEventQueryTarget> targets,
+            CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+            if (maxResults < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxResults));
+            }
+
+            return Task.Run(
+                () => ReadCore(channel, startUtc, endUtc, maxResults, targets, cancellationToken),
+                cancellationToken);
+        }
+
+        private static WindowsEventReadResult ReadCore(
+            string channel,
+            DateTimeOffset startUtc,
+            DateTimeOffset endUtc,
+            int maxResults,
+            IReadOnlyList<WindowsEventQueryTarget> targets,
             CancellationToken cancellationToken)
         {
             // 事件 XPath 的 SystemTime 比较需要 UTC “Z” 格式。
             var xpath = $"*[System[TimeCreated[@SystemTime >= '{startUtc.ToUniversalTime():yyyy-MM-ddTHH:mm:ss.fffZ}' "
-                + $"and @SystemTime <= '{endUtc.ToUniversalTime():yyyy-MM-ddTHH:mm:ss.fffZ}']]]";
+                + $"and @SystemTime <= '{endUtc.ToUniversalTime():yyyy-MM-ddTHH:mm:ss.fffZ}']"
+                + BuildTargetPredicate(targets) + "]]";
 
             var results = new List<RawWindowsEvent>(Math.Min(maxResults, 128));
-            var query = new EventLogQuery(channel, PathType.LogName, xpath);
+            var query = new EventLogQuery(channel, PathType.LogName, xpath)
+            {
+                ReverseDirection = true
+            };
             using var reader = new EventLogReader(query);
 
             while (results.Count < maxResults)
@@ -74,7 +102,38 @@ namespace AIGeekTuner.Services.Incidents
                 }
             }
 
-            return results;
+            var mayBeTruncated = false;
+            if (results.Count >= maxResults)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                using var next = reader.ReadEvent();
+                mayBeTruncated = next is not null;
+            }
+
+            return new WindowsEventReadResult(results, mayBeTruncated);
+        }
+
+        private static string BuildTargetPredicate(
+            IReadOnlyList<WindowsEventQueryTarget> targets)
+        {
+            if (targets.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var clauses = targets.Select(target =>
+            {
+                var provider = target.ProviderName.Replace("'", "&apos;", StringComparison.Ordinal);
+                var providerClause = $"Provider[@Name='{provider}']";
+                if (target.EventIds is null || target.EventIds.Count == 0)
+                {
+                    return providerClause;
+                }
+
+                var ids = string.Join(" or ", target.EventIds.Select(id => $"EventID={id}"));
+                return $"({providerClause} and ({ids}))";
+            });
+            return " and (" + string.Join(" or ", clauses) + ")";
         }
 
         private static string SafeProviderName(EventRecord record)

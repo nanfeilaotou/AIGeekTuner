@@ -1,4 +1,5 @@
 using AIGeekTuner.Models;
+using AIGeekTuner.Models.Sessions;
 using AIGeekTuner.Services.Safety;
 
 namespace AIGeekTuner.Tests.Services.Safety;
@@ -113,6 +114,79 @@ public class SafetyGuardServiceTests
 
         // 过度确定性规则只在低置信度时生效；高置信度下不产生警告。
         Assert.Equal(SafetyStatus.Approved, result.Status);
+    }
+
+    [Fact]
+    public async Task ValidateSession_RejectsOnlyUnsafeRecommendation_AndKeepsNormalAdvice()
+    {
+        var result = new SessionAnalysisResult(
+            "可能存在供电问题，需要复测。",
+            SessionOverallAssessment.Attention,
+            0.7,
+            [new SessionFinding(
+                "供电迹象",
+                SessionFindingCategory.Power,
+                "需要确认",
+                "当前证据只支持进一步检查。",
+                [])],
+            [
+                new SessionRecommendation("将 Vcore 提升到 1.85V"),
+                new SessionRecommendation("记录复测时的温度和时钟变化"),
+            ],
+            [],
+            "当前建议先记录复测结果。" );
+
+        var outcome = await _service.ValidateSessionAsync(result);
+
+        Assert.Equal(SafetyStatus.Rejected, outcome.Safety.Status);
+        Assert.True(outcome.WasTransformed);
+        var remaining = Assert.Single(outcome.Result.Recommendations);
+        Assert.Equal("记录复测时的温度和时钟变化", remaining.Text);
+        Assert.DoesNotContain("1.85V", outcome.Result.SpokenSummary);
+    }
+
+    [Fact]
+    public async Task ValidateSession_UnsafeSpokenSummary_IsNotSentToTts()
+    {
+        var result = new SessionAnalysisResult(
+            "需要继续确认。",
+            SessionOverallAssessment.Attention,
+            0.8,
+            [],
+            [new SessionRecommendation("记录当前 Vcore")],
+            [],
+            "请将 Vcore 提升到 1.85V 后继续。" );
+
+        var outcome = await _service.ValidateSessionAsync(result);
+
+        Assert.Equal(SafetyStatus.Rejected, outcome.Safety.Status);
+        Assert.True(outcome.WasTransformed);
+        Assert.DoesNotContain("1.85V", outcome.Result.SpokenSummary);
+        Assert.Single(outcome.Result.Recommendations);
+    }
+
+    [Fact]
+    public async Task ValidateSession_NormalRecommendation_IsKept_EvenWhenEvidenceIdsAreNotUsedAsCausalProof()
+    {
+        var result = new SessionAnalysisResult(
+            "观测到一次需要复测的波动。",
+            SessionOverallAssessment.Attention,
+            0.6,
+            [new SessionFinding(
+                "波动",
+                SessionFindingCategory.Stability,
+                "待确认",
+                "这是相关性观察，不是因果结论。",
+                ["missing-or-unsupported-id"])],
+            [new SessionRecommendation("重新运行稳定性测试并记录结果")],
+            [],
+            "请重新运行稳定性测试并记录结果。" );
+
+        var outcome = await _service.ValidateSessionAsync(result);
+
+        Assert.Equal(SafetyStatus.Approved, outcome.Safety.Status);
+        Assert.False(outcome.WasTransformed);
+        Assert.Single(outcome.Result.Recommendations);
     }
 
     private static DiagnosticResult CreateResult(

@@ -20,6 +20,19 @@ namespace AIGeekTuner.Services.Incidents
     {
         private const int MaxSummaryLength = 300;
 
+        public static IReadOnlyList<WindowsEventQueryTarget> QueryTargets { get; } =
+        [
+            new("Kernel-Power", [41]),
+            new("EventLog", [6008]),
+            new("Microsoft-Windows-WER-SystemErrorReporting", [1001]),
+            new("Microsoft-Windows-WHEA-Logger"),
+            new("Display", [4101]),
+            new("disk", [7, 51, 153]),
+            new("Application Error", [1000]),
+            new("Application Hang", [1002]),
+            new("Windows Error Reporting", [1001]),
+        ];
+
         public const int MaxDetailsLength = 2000;
 
         public static WindowsIncident? Map(RawWindowsEvent raw)

@@ -18,6 +18,15 @@ namespace AIGeekTuner.Services.Hardware.Inventory
     public interface IHardwareInventoryService
     {
         Task<HardwareInventorySnapshot> CollectAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>显式失效并刷新静态快照；默认实现兼容旧替身。</summary>
+        Task<HardwareInventorySnapshot> RefreshAsync(
+            CancellationToken cancellationToken = default) =>
+            CollectAsync(cancellationToken);
+
+        void Invalidate()
+        {
+        }
     }
 
     public sealed class HardwareInventoryService : IHardwareInventoryService
@@ -32,6 +41,7 @@ namespace AIGeekTuner.Services.Hardware.Inventory
         private readonly INetworkAdapterSource _networkAdapters;
         private readonly object _collectionGate = new();
         private Task<HardwareInventorySnapshot>? _collectionTask;
+        private HardwareInventorySnapshot? _lastSuccessfulSnapshot;
 
         private static readonly string[] CpuProperties =
         ["Name", "Manufacturer", "NumberOfCores", "NumberOfLogicalProcessors",
@@ -88,11 +98,63 @@ namespace AIGeekTuner.Services.Hardware.Inventory
                 task = _collectionTask;
             }
 
-            // Cancellation cancels only this caller's wait.  The shared startup
-            // snapshot continues so Dashboard and Hardware detail cannot diverge.
+            _ = task.ContinueWith(completed =>
+            {
+                lock (_collectionGate)
+                {
+                    if (completed.Status == TaskStatus.RanToCompletion)
+                    {
+                        _lastSuccessfulSnapshot = completed.Result;
+                    }
+                    else if (ReferenceEquals(_collectionTask, completed))
+                    {
+                        _collectionTask = null;
+                    }
+                }
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+            // Cancellation cancels only this caller's wait. The shared
+            // collection continues so callers cannot diverge. With no caller
+            // cancellation token, preserve the single-flight Task identity.
             return cancellationToken.CanBeCanceled
                 ? task.WaitAsync(cancellationToken)
                 : task;
+        }
+
+        public async Task<HardwareInventorySnapshot> RefreshAsync(
+            CancellationToken cancellationToken = default)
+        {
+            lock (_collectionGate)
+            {
+                _collectionTask = null;
+            }
+
+            try
+            {
+                return await CollectAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A failed refresh must not discard the last known-good static
+                // inventory; callers can keep rendering it and retry later.
+                lock (_collectionGate)
+                {
+                    if (_lastSuccessfulSnapshot is not null)
+                    {
+                        return _lastSuccessfulSnapshot;
+                    }
+                }
+
+                throw;
+            }
+        }
+
+        public void Invalidate()
+        {
+            lock (_collectionGate)
+            {
+                _collectionTask = null;
+            }
         }
 
         private async Task<HardwareInventorySnapshot> CollectParallelAsync()

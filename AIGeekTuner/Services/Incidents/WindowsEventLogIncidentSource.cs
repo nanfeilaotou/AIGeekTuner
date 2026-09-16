@@ -35,12 +35,16 @@ namespace AIGeekTuner.Services.Incidents
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    var raws = await _reader.ReadAsync(
+                    var read = await _reader.ReadDetailedAsync(
                         channel, query.StartUtc, query.EndUtc, query.MaxResults,
+                        WindowsIncidentMapper.QueryTargets,
                         cancellationToken).ConfigureAwait(false);
-                    rawEvents.AddRange(raws);
+                    rawEvents.AddRange(read.Events);
                     channelResults.Add(new IncidentChannelResult(
-                        channel, IncidentQueryStatus.Success, null, raws.Count));
+                        channel, IncidentQueryStatus.Success, null, read.Events.Count)
+                    {
+                        MayBeTruncated = read.MayBeTruncated
+                    });
                 }
                 catch (OperationCanceledException)
                 {
@@ -69,24 +73,33 @@ namespace AIGeekTuner.Services.Incidents
                 }
             }
 
-            var incidents = BuildIncidents(rawEvents, query.MaxResults);
-            return new IncidentQueryResult(incidents, channelResults)
+            var build = BuildIncidentsWithTruncation(rawEvents, query.MaxResults);
+            return new IncidentQueryResult(build.Incidents, channelResults)
             {
                 Status = AggregateStatus(channelResults),
+                MayBeTruncated = channelResults.Any(channel => channel.MayBeTruncated)
+                    || build.MayBeTruncated
             };
         }
 
         /// <summary>映射 → 去重 → 时间升序 → 保留最近 MaxResults 条 → 稳定 EvidenceId。</summary>
         internal static IReadOnlyList<WindowsIncident> BuildIncidents(
             IReadOnlyList<RawWindowsEvent> rawEvents, int maxResults)
+            => BuildIncidentsWithTruncation(rawEvents, maxResults).Incidents;
+
+        private static IncidentBuildResult BuildIncidentsWithTruncation(
+            IReadOnlyList<RawWindowsEvent> rawEvents, int maxResults)
         {
-            var mapped = rawEvents
+            var candidates = rawEvents
                 .Select(WindowsIncidentMapper.Map)
                 .Where(incident => incident is not null)
                 .Select(incident => incident!)
                 .Distinct(DedupKeyComparer.Instance)
                 .OrderByDescending(incident => incident.OccurredAtUtc)
                 .ThenByDescending(incident => incident.RecordId ?? long.MinValue)
+                .ToArray();
+
+            var mapped = candidates
                 .Take(maxResults)
                 .OrderBy(incident => incident.OccurredAtUtc)
                 .ThenBy(incident => incident.RecordId ?? long.MinValue)
@@ -101,8 +114,12 @@ namespace AIGeekTuner.Services.Incidents
                 });
             }
 
-            return results;
+            return new IncidentBuildResult(results, candidates.Length > maxResults);
         }
+
+        private sealed record IncidentBuildResult(
+            IReadOnlyList<WindowsIncident> Incidents,
+            bool MayBeTruncated);
 
         internal static IncidentQueryStatus AggregateStatus(
             IReadOnlyList<IncidentChannelResult> channels)

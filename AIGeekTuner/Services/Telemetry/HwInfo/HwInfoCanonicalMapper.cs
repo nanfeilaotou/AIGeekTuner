@@ -18,25 +18,23 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
             DateTimeOffset capturedAtUtc)
         {
             var result = new List<TelemetryReading>();
-            var nameByIndex = sensors.ToDictionary(
+            var sensorByIndex = sensors.ToDictionary(
                 sensor => sensor.SensorIndex,
-                sensor => sensor.SensorName);
-
-            var gpuOrdinals = sensors
-                .Where(sensor => IsFamily(sensor.SensorName, "GPU"))
-                .Select(sensor => sensor.SensorIndex)
-                .Distinct()
-                .OrderBy(index => index)
-                .Select((index, ordinal) => (index, ordinal))
-                .ToDictionary(pair => pair.index, pair => pair.ordinal);
+                sensor => sensor);
 
             foreach (var reading in readings)
             {
-                if (!nameByIndex.TryGetValue(reading.SensorIndex, out var sensorName))
+                if (!sensorByIndex.TryGetValue(reading.SensorIndex, out var sensor))
                 {
                     continue; // 没有父传感器的孤儿读数：只可能来自损坏数据，拒绝。
                 }
 
+                var sensorName = sensor.SensorName;
+                var deviceInfo = DescribeSourceDevice(sensors, reading.SensorIndex);
+                var sourceDevice = new TelemetryDeviceIdentity(
+                    deviceInfo.Kind,
+                    deviceInfo.NativeDeviceId,
+                    deviceInfo.NativeDeviceName);
                 var unit = ResolveUnit(reading);
                 var label = reading.Label.Trim();
 
@@ -52,8 +50,7 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
                         TelemetryMetricKey.MemoryModuleTemperature,
                         reading.Value,
                         TelemetryUnit.Celsius,
-                        TelemetryDeviceIdentity.MemoryModule(
-                            $"memory-module:{moduleIndex}", sensorName),
+                        sourceDevice,
                         TelemetrySourceKind.HwInfo,
                         CompositeSourceId(reading),
                         reading.Label,
@@ -63,19 +60,18 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
 
                 if (IsFamily(sensorName, "CPU"))
                 {
-                    MapCpuReading(result, reading, label, unit, capturedAtUtc);
+                    MapCpuReading(result, reading, label, unit, sourceDevice, capturedAtUtc);
                 }
-                else if (IsFamily(sensorName, "GPU")
-                    && gpuOrdinals.TryGetValue(reading.SensorIndex, out var ordinal))
+                else if (IsFamily(sensorName, "GPU"))
                 {
                     MapGpuReading(
                         result, reading, label, unit,
-                        TelemetryDeviceIdentity.GpuByIndex(ordinal, sensorName),
+                        sourceDevice,
                         capturedAtUtc);
                 }
                 else if (IsFamily(sensorName, "RAM") || IsFamily(sensorName, "Memory"))
                 {
-                    MapMemoryReading(result, reading, label, unit, capturedAtUtc);
+                    MapMemoryReading(result, reading, label, unit, sourceDevice, capturedAtUtc);
                 }
 
                 // 其余家族（主板、盘、芯片组等）本轮一律保持 Raw，不做猜测性映射。
@@ -89,10 +85,9 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
             HwInfoReadingEntry reading,
             string label,
             TelemetryUnit unit,
+            TelemetryDeviceIdentity device,
             DateTimeOffset capturedAtUtc)
         {
-            var device = TelemetryDeviceIdentity.Cpu("CPU");
-
             if (unit == TelemetryUnit.Celsius
                 && LabelEquals(label, "CPU Package")
                 && IsValidTemperature(reading.Value))
@@ -180,10 +175,9 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
             HwInfoReadingEntry reading,
             string label,
             TelemetryUnit unit,
+            TelemetryDeviceIdentity device,
             DateTimeOffset capturedAtUtc)
         {
-            var device = TelemetryDeviceIdentity.Memory("Memory");
-
             if (unit is TelemetryUnit.Megabyte or TelemetryUnit.Gigabyte
                 && reading.Value >= 0
                 && (LabelEquals(label, "Used Memory") || LabelEquals(label, "Memory Used")))
@@ -294,7 +288,7 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
                 // 它们描述同一物理单元——折叠为单一逻辑设备，避免 canonical 碎片化。
                 return new SourceDeviceInfo(
                     TelemetrySourceKind.HwInfo, TelemetryDeviceKind.Cpu,
-                    "cpu", sensor.SensorName, 0, []);
+                    NativeSensorKey(sensor, "cpu"), sensor.SensorName, 0, []);
             }
 
             if (IsFamily(sensor.SensorName, "GPU"))
@@ -308,10 +302,8 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
                     .FirstOrDefault(pair => pair.index == sensorIndex).position;
                 return new SourceDeviceInfo(
                     TelemetrySourceKind.HwInfo, TelemetryDeviceKind.Gpu,
-                    // V2-M4.5C 修复：canonical Device（GpuByIndex(ordinal)）与
-                    // SourceDeviceInfo.NativeDeviceId 必须同键，否则 Hub lookup
-                    // 永远 miss，HWiNFO GPU 永远不与其它来源合并。
-                    $"gpu:{ordinal}", sensor.SensorName, ordinal, []);
+                    NativeSensorKey(sensor, $"gpu:{ordinal}"),
+                    sensor.SensorName, ordinal, []);
             }
 
             // V2-M4.5B：每模块传感器（RAM Module #N / DIMM N / DDR5 DIMM [#N] (…)）
@@ -324,20 +316,29 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
                     : Array.Empty<string>();
                 return new SourceDeviceInfo(
                     TelemetrySourceKind.HwInfo, TelemetryDeviceKind.MemoryModule,
-                    $"memory-module:{moduleIndex}", sensor.SensorName, moduleIndex, strongIds);
+                    NativeSensorKey(sensor, $"memory-module:{moduleIndex}"),
+                    sensor.SensorName, moduleIndex, strongIds);
             }
 
             if (IsFamily(sensor.SensorName, "RAM") || IsFamily(sensor.SensorName, "Memory"))
             {
                 return new SourceDeviceInfo(
                     TelemetrySourceKind.HwInfo, TelemetryDeviceKind.Memory,
-                    "memory", sensor.SensorName, 0, []);
+                    NativeSensorKey(sensor, "memory"), sensor.SensorName, 0, []);
             }
 
             return new SourceDeviceInfo(
                 TelemetrySourceKind.HwInfo, TelemetryDeviceKind.System,
-                $"shm:{sensorIndex}", sensor.SensorName, (int)sensorIndex, []);
+                NativeSensorKey(sensor, $"shm:{sensorIndex}"),
+                sensor.SensorName, (int)sensorIndex, []);
         }
+
+        private static string NativeSensorKey(HwInfoSensorEntry sensor, string fallback) =>
+            sensor.SensorId is uint id && sensor.SensorInstance is uint instance
+                ? string.Create(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    $"sensor:{id:x8}:{instance}")
+                : fallback;
 
         /// <summary>
         /// 按父传感器名分族给出设备身份；无法归族的传感器挂 system 设备（Raw 保真）。

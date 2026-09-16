@@ -135,9 +135,7 @@ public sealed class SessionExportService : ISessionExportService
 
     private SessionBundle LoadBundle(string sessionId)
     {
-        if (string.IsNullOrWhiteSpace(sessionId)
-            || sessionId != Path.GetFileName(sessionId)
-            || sessionId.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        if (!SessionPathGuard.TryNormalizeId(sessionId, out _))
         {
             throw new SessionExportException("会话 ID 不能为空。" );
         }

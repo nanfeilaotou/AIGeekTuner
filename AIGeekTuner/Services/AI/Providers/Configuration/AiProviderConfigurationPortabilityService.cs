@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using AIGeekTuner.Services.AI.Providers.Transport;
 using AIGeekTuner.Services.AI.Providers.Credentials;
 using AIGeekTuner.Services.Diagnostics;
 using AIGeekTuner.Services.Storage;
@@ -92,6 +93,8 @@ public sealed class AiProviderConfigurationPortabilityService
         string sourcePath,
         CancellationToken cancellationToken = default)
     {
+        var credentialMutations = new List<CredentialOriginMutation>();
+        var committed = false;
         try
         {
             var json = await File.ReadAllTextAsync(sourcePath, cancellationToken);
@@ -122,6 +125,10 @@ public sealed class AiProviderConfigurationPortabilityService
                 current.ActiveProviderId,
                 document.ActiveProviderId,
                 merged);
+            credentialMutations = await PrepareCrossOriginCredentialBindingsAsync(
+                current.Profiles,
+                importedProfiles,
+                cancellationToken);
             var missingCredentials = await FindMissingCredentialsAsync(
                 importedProfiles,
                 cancellationToken);
@@ -135,6 +142,7 @@ public sealed class AiProviderConfigurationPortabilityService
                     ActiveProviderId = activeProviderId
                 },
                 cancellationToken);
+            committed = true;
 
             return new AiProviderImportResult(
                 activeProviderId,
@@ -142,18 +150,34 @@ public sealed class AiProviderConfigurationPortabilityService
         }
         catch (AiProviderPortabilityException)
         {
+            if (!committed)
+            {
+                await RollbackCredentialOriginsAsync(credentialMutations);
+            }
             throw;
         }
         catch (AiProviderStoreException exception)
         {
+            if (!committed)
+            {
+                await RollbackCredentialOriginsAsync(credentialMutations);
+            }
             throw new AiProviderPortabilityException(exception.Message, exception);
         }
         catch (OperationCanceledException)
         {
+            if (!committed)
+            {
+                await RollbackCredentialOriginsAsync(credentialMutations);
+            }
             throw;
         }
         catch (JsonException exception)
         {
+            if (!committed)
+            {
+                await RollbackCredentialOriginsAsync(credentialMutations);
+            }
             throw new AiProviderPortabilityException("Provider 备份不是有效的 JSON 文件。", exception);
         }
         catch (Exception exception) when (exception is IOException
@@ -161,9 +185,96 @@ public sealed class AiProviderConfigurationPortabilityService
                                              or ArgumentException
                                              or NotSupportedException)
         {
+            if (!committed)
+            {
+                await RollbackCredentialOriginsAsync(credentialMutations);
+            }
             throw new AiProviderPortabilityException("Provider 配置导入失败，请检查文件和本地数据目录。", exception);
         }
     }
+
+    private async Task<List<CredentialOriginMutation>> PrepareCrossOriginCredentialBindingsAsync(
+        IReadOnlyList<AiProviderProfile> currentProfiles,
+        IReadOnlyList<AiProviderProfile> importedProfiles,
+        CancellationToken cancellationToken)
+    {
+        var mutations = new List<CredentialOriginMutation>();
+        // Legacy/in-memory stores that do not persist origin metadata keep their
+        // existing behavior here; origin-aware stores can retain the old secret
+        // without allowing it to authenticate against the imported origin.
+        if (_credentials is not IAiCredentialOriginStore)
+        {
+            return mutations;
+        }
+
+        try
+        {
+            foreach (var imported in importedProfiles)
+            {
+                var current = currentProfiles.FirstOrDefault(profile =>
+                    string.Equals(profile.Id, imported.Id, StringComparison.Ordinal));
+                if (current is null
+                    || current.Kind != AiProviderKind.OpenAiCompatible
+                    || imported.Kind != AiProviderKind.OpenAiCompatible
+                    || AiProviderOrigin.Equals(current.BaseUrl, imported.BaseUrl))
+                {
+                    continue;
+                }
+
+                var secret = await _credentials.LoadAsync(imported.Id, cancellationToken);
+                if (secret is null)
+                {
+                    continue;
+                }
+
+                var previousOrigin = await _credentials.LoadOriginAsync(imported.Id, cancellationToken);
+                var oldOrigin = AiProviderOrigin.TryNormalize(current.BaseUrl, out var normalized)
+                    ? normalized
+                    : null;
+                await _credentials.SaveAsync(
+                    imported.Id, secret, oldOrigin, cancellationToken);
+                var storedOrigin = await _credentials.LoadOriginAsync(imported.Id, cancellationToken);
+                if (!string.Equals(storedOrigin, oldOrigin, StringComparison.OrdinalIgnoreCase))
+                {
+                    await _credentials.DeleteAsync(imported.Id, cancellationToken);
+                }
+
+                mutations.Add(new CredentialOriginMutation(
+                    imported.Id, secret, previousOrigin));
+            }
+
+            return mutations;
+        }
+        catch
+        {
+            await RollbackCredentialOriginsAsync(mutations);
+            throw;
+        }
+    }
+
+    private async Task RollbackCredentialOriginsAsync(
+        IReadOnlyList<CredentialOriginMutation> mutations)
+    {
+        foreach (var mutation in mutations)
+        {
+            try
+            {
+                await _credentials.SaveAsync(
+                    mutation.ProviderId,
+                    mutation.Secret,
+                    mutation.PreviousOrigin);
+            }
+            catch (Exception exception)
+            {
+                ExceptionLogWriter.Write(exception, "AI provider import credential rollback");
+            }
+        }
+    }
+
+    private sealed record CredentialOriginMutation(
+        string ProviderId,
+        string Secret,
+        string? PreviousOrigin);
 
     private static IReadOnlyList<AiProviderProfile> NormalizeAndValidate(
         IReadOnlyList<AiProviderProfile> profiles)
@@ -264,7 +375,12 @@ public sealed class AiProviderConfigurationPortabilityService
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(await _credentials.LoadAsync(profile.Id, cancellationToken)))
+                var secret = await _credentials.LoadAsync(profile.Id, cancellationToken);
+                var origin = await _credentials.LoadOriginAsync(profile.Id, cancellationToken);
+                var originMatches = origin is null
+                    || !AiProviderOrigin.TryNormalize(profile.BaseUrl, out var currentOrigin)
+                    || string.Equals(origin, currentOrigin, StringComparison.OrdinalIgnoreCase);
+                if (string.IsNullOrWhiteSpace(secret) || !originMatches)
                 {
                     missing.Add(profile.Id);
                 }

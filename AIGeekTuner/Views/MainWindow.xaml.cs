@@ -203,6 +203,7 @@ namespace AIGeekTuner
                 runtimeProvider: async () => await runtimeSnapshotSource.TryCaptureAsync(
                     ConfigurationStore.Snapshot().Ollama.TimeoutSeconds));
             var analysisStore = new SessionAnalysisStore(applicationDataPaths.SessionsDirectory);
+            var safetyService = new SafetyGuardService();
 
             // V2-M4.2：Windows Incident correlation（录制结束后的独立证据采集阶段）。
             // 只读查询本机 System/Application 事件日志；失败由 SessionsViewModel 隔离，
@@ -259,9 +260,9 @@ namespace AIGeekTuner
                 incidentCorrelation,
                 incidentStore,
                 sessionExportService,
-                fileDialogs);
+                fileDialogs,
+                safetyService);
 
-            var safetyService = new SafetyGuardService();
             // V2-M5.1B.2：诊断请求经 AiChatRuntime 走当前 Provider；
             // PromptBuilder / Parser / grounding repair / SafetyGuard 各司其职。
             _diagnosisService = new DiagnosisService(
@@ -407,7 +408,7 @@ namespace AIGeekTuner
             _windowChromeHitTestRouter = null;
 
             // V2-M3.2：先停实时轮询再收尾录制，避免镜像模式下双路径并发。
-            _liveTelemetryCoordinator.Stop();
+            _liveTelemetryCoordinator.Dispose();
 
             // 录制中的会话 best-effort 收尾（§34）：不阻塞退出超过 5 秒。
             try

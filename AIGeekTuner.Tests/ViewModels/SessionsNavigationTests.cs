@@ -812,7 +812,7 @@ namespace AIGeekTuner.Tests.ViewModels
             await analyzeTask;
         }
 
-        /// <summary>Gate K(2)+(3)：A 完成时用户在 B 上——B 展示不变；A 的 analysis.json 必然落盘。</summary>
+        /// <summary>切换到 B 后，A 的在途结果不再落盘，也不污染 B。</summary>
         [Fact]
         public async Task AnalyzeA_SwitchB_ACompletes_BResultUnchanged_PersistsA()
         {
@@ -835,11 +835,51 @@ namespace AIGeekTuner.Tests.ViewModels
             Assert.Equal("s-b", viewModel.CurrentDetailSessionId);
             Assert.False(viewModel.HasAnalysis);                    // B 的 Detail 未被 A 的结果污染
             Assert.False(viewModel.IsCurrentDetailAnalyzing);
-            // Gate K(3)：A 的分析已持久化到 analysis.json（文件事实，与界面无关）。
-            Assert.NotNull(analysisStore.Load("s-a"));
+            Assert.Null(analysisStore.Load("s-a"));
         }
 
-        /// <summary>Gate K(4)：A 分析中切走再切回 → A 显示“分析中”；完成 → A 结果渲染。</summary>
+        private sealed class RecordingVoiceService : IVoiceSynthesisService
+        {
+            public int Calls { get; private set; }
+            public List<string> Texts { get; } = [];
+
+            public Task<VoiceSynthesisResult> SynthesizeAsync(
+                string text, VoiceConfiguration configuration, CancellationToken cancellationToken)
+            {
+                Calls++;
+                Texts.Add(text);
+                return Task.FromResult(VoiceSynthesisResult.Ok(TestWav.Create()));
+            }
+        }
+
+        private sealed class UnsafeAnalysisService : ISessionAnalysisService
+        {
+            public Task<SessionAnalysisRun> AnalyzeAsync(
+                DiagnosticEvidenceContext context,
+                CancellationToken cancellationToken) =>
+                Task.FromResult(new SessionAnalysisRun(
+                    true,
+                    new SessionAnalysisResult(
+                        "需要进一步确认。",
+                        SessionOverallAssessment.Attention,
+                        0.8,
+                        [],
+                        [
+                            new SessionRecommendation("将 Vcore 提升到 1.85V"),
+                            new SessionRecommendation("记录复测温度和时钟")
+                        ],
+                        [],
+                        "请将 Vcore 提升到 1.85V 后继续。"),
+                    null,
+                    [],
+                    1,
+                    TimeSpan.FromMilliseconds(1),
+                    "unsafe-test-model",
+                    false,
+                    "{}"));
+        }
+
+        /// <summary>切换会话会取消旧请求；切回 A 不恢复已过期的在途状态。</summary>
         [Fact]
         public async Task SwitchBackA_DuringRun_AnalyzingVisible_ThenResultRendered()
         {
@@ -856,18 +896,59 @@ namespace AIGeekTuner.Tests.ViewModels
             OpenDetail(viewModel, "s-a");
 
             Assert.Equal("s-a", viewModel.CurrentDetailSessionId);
-            Assert.True(viewModel.IsCurrentDetailAnalyzing);        // 切回 A：分析中可见
+            Assert.False(viewModel.IsCurrentDetailAnalyzing);       // 切换已取消 A 的请求
             Assert.False(viewModel.HasAnalysis);                    // 尚无结果
 
             analysis.Complete();
             await analyzeTask;
 
-            Assert.True(viewModel.HasAnalysis);                     // 完成后 A 结果渲染
-            Assert.Equal("总体正常", viewModel.AnalysisSummary);
+            Assert.False(viewModel.HasAnalysis);                    // 过期结果不渲染
             Assert.False(viewModel.IsCurrentDetailAnalyzing);
         }
 
-        /// <summary>Gate K(5)：A 完成后才切回 → 经 analysis.json 恢复显示 A 结果（非实时渲染路径）。</summary>
+        [Fact]
+        public async Task PageExit_CancelsAnalysis_AndDoesNotPersistLateResult()
+        {
+            var store = new TelemetrySessionStore(_temp.FullPath);
+            SaveSession(store, "s-a");
+            var analysis = new GatedAnalysisService();
+            var analysisStore = new SessionAnalysisStore(_temp.FullPath);
+            var (viewModel, _) = Create(analysis: analysis);
+            OpenDetail(viewModel, "s-a");
+
+            var analyzeTask = viewModel.AnalyzeCommand.ExecuteAsync();
+            await WaitUntilAsync(() => viewModel.IsAnalyzing);
+            viewModel.OnPageExited();
+            analysis.Complete();
+            await analyzeTask;
+
+            Assert.Null(analysisStore.Load("s-a"));
+        }
+
+        [Fact]
+        public async Task DeleteWhileAnalysisInFlight_DoesNotRecreateAnalysisFile()
+        {
+            var store = new TelemetrySessionStore(_temp.FullPath);
+            SaveSession(store, "s-a");
+            var analysis = new GatedAnalysisService();
+            var analysisStore = new SessionAnalysisStore(_temp.FullPath);
+            var (viewModel, _) = Create(analysis: analysis);
+            OpenDetail(viewModel, "s-a");
+
+            var analyzeTask = viewModel.AnalyzeCommand.ExecuteAsync();
+            await WaitUntilAsync(() => viewModel.IsAnalyzing);
+            EnterHistory(viewModel);
+            viewModel.SelectedRecent = viewModel.RecentSessions.Single(item => item.Id == "s-a");
+            viewModel.ConfirmDelete = _ => true;
+            viewModel.DeleteRecentCommand.Execute(null);
+            analysis.Complete();
+            await analyzeTask;
+
+            Assert.Null(analysisStore.Load("s-a"));
+            Assert.False(Directory.Exists(Path.Combine(_temp.FullPath, "s-a")));
+        }
+
+        /// <summary>切换后 A 的旧请求不生成 analysis.json。</summary>
         [Fact]
         public async Task SwitchBackA_AfterCompletion_RestoredFromDisk()
         {
@@ -885,8 +966,7 @@ namespace AIGeekTuner.Tests.ViewModels
             await analyzeTask;
 
             OpenDetail(viewModel, "s-a");
-            Assert.True(viewModel.HasAnalysis);                     // analysis.json restore
-            Assert.Equal("总体正常", viewModel.AnalysisSummary);
+            Assert.False(viewModel.HasAnalysis);
         }
 
         /// <summary>Gate K(6)：B 已分析过 → 从 A 的运行中切到 B，B 显示自己的旧结果，不受 A 影响。</summary>
@@ -916,7 +996,7 @@ namespace AIGeekTuner.Tests.ViewModels
             Assert.Equal("结合遥测的确定性说明。", viewModel.AnalysisSummary);   // A 完成也不改写 B
         }
 
-        /// <summary>Gate K(7)：A 完成时用户在 B 上 → 历史列表 A 的“已分析”标记照样更新。</summary>
+        /// <summary>切换后历史列表不会把过期请求标成已分析。</summary>
         [Fact]
         public async Task HistoryMarker_Updates_AfterCompletion_EvenIfDetailIsB()
         {
@@ -935,7 +1015,7 @@ namespace AIGeekTuner.Tests.ViewModels
             analysis.Complete();
             await analyzeTask;
 
-            Assert.True(viewModel.RecentSessions.Single(item => item.Id == "s-a").IsAnalyzed);   // Gate D ② LoadRecent
+            Assert.False(viewModel.RecentSessions.Single(item => item.Id == "s-a").IsAnalyzed);
         }
 
         // ==================== M4.5E.2 Gate K：Voice 缓存恢复 / per-session ====================
@@ -998,7 +1078,56 @@ namespace AIGeekTuner.Tests.ViewModels
             Assert.Equal("未生成", viewModel.VoiceStateText);
         }
 
-        /// <summary>Gate K(12)：A 生成语音中切 B → B 不显示生成中；完成不改变 B；切回 A 显示已生成。</summary>
+        [Fact]
+        public async Task SessionAnalysis_UsesSafetyVersionForSavedUiAndTts()
+        {
+            var store = new TelemetrySessionStore(_temp.FullPath);
+            SaveSession(store, "s-unsafe");
+            var voice = new RecordingVoiceService();
+            var (viewModel, _) = Create(
+                analysis: new UnsafeAnalysisService(),
+                voiceEndpoint: "http://localhost:9880",
+                voice: voice);
+
+            OpenDetail(viewModel, "s-unsafe");
+            await viewModel.AnalyzeCommand.ExecuteAsync();
+            await WaitUntilAsync(() => voice.Calls == 1);
+
+            var saved = new SessionAnalysisStore(_temp.FullPath).Load("s-unsafe");
+            Assert.NotNull(saved);
+            Assert.Single(saved!.Result.Recommendations);
+            Assert.Equal("记录复测温度和时钟", saved.Result.Recommendations[0].Text);
+            Assert.DoesNotContain("1.85V", saved.Result.SpokenSummary);
+            Assert.Single(viewModel.Recommendations);
+            Assert.DoesNotContain("1.85V", viewModel.Recommendations[0]);
+            Assert.Single(voice.Texts);
+            Assert.DoesNotContain("1.85V", voice.Texts[0]);
+        }
+
+        [Fact]
+        public void SessionA_VoiceCacheSurvivesSwitchToB_AndReopenAWithoutRegeneration()
+        {
+            var store = new TelemetrySessionStore(_temp.FullPath);
+            var analysisStore = new SessionAnalysisStore(_temp.FullPath);
+            SaveSession(store, "s-a");
+            SaveSession(store, "s-b");
+            analysisStore.Save(new SessionAnalysisEnvelope(
+                1, "s-a", T0, "test-model", 100, false, MakeAnalysisResult(), "{}"));
+            analysisStore.Save(new SessionAnalysisEnvelope(
+                1, "s-b", T0, "test-model", 100, false, MakeAnalysisResult(), "{}"));
+            analysisStore.SaveVoiceWav("s-a", TestWav.Create());
+            var voice = new GatedVoiceService();
+            var (viewModel, _) = Create(voiceEndpoint: "", voice: voice);
+
+            OpenDetail(viewModel, "s-a");
+            OpenDetail(viewModel, "s-b");
+            OpenDetail(viewModel, "s-a");
+
+            Assert.Equal(0, voice.Calls);
+            Assert.Equal("语音已生成 · 播放将直接使用缓存", viewModel.VoiceStateText);
+        }
+
+        /// <summary>语音生成中切 B 会取消 A 的写盘；B 和 A 都不显示过期缓存。</summary>
         [Fact]
         public async Task GenerateA_SwitchB_CompletionDoesNotAlterB_SwitchBackShowsGenerated()
         {
@@ -1019,12 +1148,15 @@ namespace AIGeekTuner.Tests.ViewModels
             Assert.Equal("未生成", viewModel.VoiceStateText);
 
             voice.Complete();
-            await WaitUntilAsync(() => analysisStore.HasCachedVoice("s-a"));
+            await Task.Delay(150);
 
             Assert.Equal("未生成", viewModel.VoiceStateText);       // B 依旧不变
+            Assert.False(analysisStore.HasCachedVoice("s-a"));     // A 的过期请求未落盘
             OpenDetail(viewModel, "s-a");
+            await WaitUntilAsync(() => voice.Calls == 2);           // A 重新成为当前会话后才允许新请求
+            await WaitUntilAsync(() => analysisStore.HasCachedVoice("s-a"));
             Assert.Equal("语音已生成 · 播放将直接使用缓存", viewModel.VoiceStateText);
-            Assert.Equal(1, voice.Calls);
+            Assert.Equal(2, voice.Calls);
         }
 
         /// <summary>Gate K(13)：切回 A → 播放可用且命中缓存（零额外合成）。</summary>

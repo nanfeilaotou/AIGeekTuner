@@ -16,5 +16,8 @@ namespace AIGeekTuner.Services.AI.Providers.Credentials
         public string ProviderId { get; set; } = string.Empty;
 
         public string ProtectedBlobBase64 { get; set; } = string.Empty;
+
+        /// <summary>凭据所属的规范化 origin；旧文件缺失时保持 null。</summary>
+        public string? Origin { get; set; }
     }
 }

@@ -18,6 +18,36 @@ namespace AIGeekTuner.Tests.Services.Telemetry.HwInfo
         ];
 
         [Fact]
+        public void SameModelGpus_UseSensorIdAndInstanceAsDistinctSourceIdentity()
+        {
+            var sensors = new[]
+            {
+                new HwInfoSensorEntry(0, "GPU: NVIDIA GeForce RTX 4090", SensorId: 77, SensorInstance: 0),
+                new HwInfoSensorEntry(1, "GPU: NVIDIA GeForce RTX 4090", SensorId: 77, SensorInstance: 1),
+            };
+            var readings = new[]
+            {
+                new HwInfoReadingEntry(0, 1, "GPU Temperature", "°C", 48, 1),
+                new HwInfoReadingEntry(0, 2, "GPU Utilization", "%", 10, 7),
+                new HwInfoReadingEntry(1, 1, "GPU Temperature", "°C", 81, 1),
+                new HwInfoReadingEntry(1, 2, "GPU Utilization", "%", 92, 7),
+            };
+
+            var canonical = HwInfoCanonicalMapper.Map(sensors, readings, CapturedAtUtc);
+
+            var keys = canonical.Select(reading => reading.Device.DeviceKey).Distinct().ToArray();
+            Assert.Equal(2, keys.Length);
+            Assert.Contains("sensor:0000004d:0", keys);
+            Assert.Contains("sensor:0000004d:1", keys);
+            Assert.Equal(48, canonical.Single(reading =>
+                reading.Device.DeviceKey == "sensor:0000004d:0"
+                && reading.MetricKey == TelemetryMetricKey.GpuCoreTemperature).Value);
+            Assert.Equal(92, canonical.Single(reading =>
+                reading.Device.DeviceKey == "sensor:0000004d:1"
+                && reading.MetricKey == TelemetryMetricKey.GpuCoreUtilization).Value);
+        }
+
+        [Fact]
         public void CpuPackage_MapsTemperaturePowerUtilization()
         {
             var readings = new[]

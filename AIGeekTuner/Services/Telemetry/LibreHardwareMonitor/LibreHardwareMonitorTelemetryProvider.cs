@@ -84,7 +84,10 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
             cancellationToken.ThrowIfCancellationRequested();
             hardware.Update();
 
-            var node = new HardwareNode(hardware.HardwareType, hardware.Name);
+            var node = new HardwareNode(
+                hardware.HardwareType,
+                hardware.Name,
+                hardware.Identifier.ToString());
             foreach (var sensor in hardware.Sensors)
             {
                 if (!sensor.Value.HasValue
@@ -160,23 +163,24 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
 
             var gpuGroups = nodes
                 .Where(node => IsGpu(node.Type))
-                .GroupBy(node => (node.Type, node.Name))
+                .GroupBy(node => node.Identifier, StringComparer.Ordinal)
                 .Select((group, order) => new
                 {
-                    group.Key,
+                    Identifier = group.Key,
+                    Type = group.First().Type,
+                    Name = group.First().Name,
                     FirstOrder = group.Min(node => node.Order)
                 })
-                .OrderBy(group => GpuPriority(group.Key.Type))
-                .ThenBy(group => group.Key.Name, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(group => GpuPriority(group.Type))
+                .ThenBy(group => group.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(group => group.Identifier, StringComparer.Ordinal)
                 .ThenBy(group => group.FirstOrder)
                 .ToArray();
-            var gpuIndexByKey = new Dictionary<(HardwareType, string), int>();
+            var gpuIndexByIdentifier = new Dictionary<string, int>(StringComparer.Ordinal);
             for (var i = 0; i < gpuGroups.Length; i++)
             {
-                gpuIndexByKey[gpuGroups[i].Key] = i;
+                gpuIndexByIdentifier[gpuGroups[i].Identifier] = i;
             }
-
-            var storageKeyUseCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
             foreach (var node in nodes)
             {
@@ -186,43 +190,46 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
                 switch (node.Type)
                 {
                     case HardwareType.Cpu:
-                        identity = TelemetryDeviceIdentity.Cpu(node.Name);
-                        nativeId = "cpu";
+                        nativeId = NativeDeviceKey(node.Identifier);
+                        identity = new TelemetryDeviceIdentity(
+                            TelemetryDeviceKind.Cpu, nativeId, node.Name);
                         break;
 
                     default:
                         if (IsGpu(node.Type))
                         {
-                            ordinal = gpuIndexByKey[(node.Type, node.Name)];
-                            identity = TelemetryDeviceIdentity.GpuByIndex(ordinal, node.Name);
-                            nativeId = identity.DeviceKey;
+                            ordinal = gpuIndexByIdentifier[node.Identifier];
+                            nativeId = NativeDeviceKey(node.Identifier);
+                            identity = new TelemetryDeviceIdentity(
+                                TelemetryDeviceKind.Gpu, nativeId, node.Name);
                         }
                         else if (node.Type == HardwareType.Memory
                             && MemoryModuleSensorNames.TryGetModuleIndex(node.Name, out var moduleIndex))
                         {
                             // V2-M4.5B Gate F：LHM 的每模块硬件（RAM Module #N）独立于
                             // 聚合 Memory 硬件，明确模块 parent 才给 MemoryModule 身份。
-                            identity = TelemetryDeviceIdentity.MemoryModule(
-                                $"memory-module:{moduleIndex}", node.Name);
-                            nativeId = identity.DeviceKey;
+                            nativeId = NativeDeviceKey(node.Identifier);
+                            identity = new TelemetryDeviceIdentity(
+                                TelemetryDeviceKind.MemoryModule, nativeId, node.Name);
                             ordinal = moduleIndex;
                         }
                         else if (node.Type == HardwareType.Memory)
                         {
-                            identity = TelemetryDeviceIdentity.Memory(node.Name);
-                            nativeId = identity.DeviceKey;
+                            nativeId = NativeDeviceKey(node.Identifier);
+                            identity = new TelemetryDeviceIdentity(
+                                TelemetryDeviceKind.Memory, nativeId, node.Name);
                         }
                         else if (node.Type == HardwareType.Storage)
                         {
-                            identity = TelemetryDeviceIdentity.Storage(
-                                ResolveStorageKey(node.Name, storageKeyUseCounts),
-                                node.Name);
-                            nativeId = identity.DeviceKey;
+                            nativeId = NativeDeviceKey(node.Identifier);
+                            identity = new TelemetryDeviceIdentity(
+                                TelemetryDeviceKind.Storage, nativeId, node.Name);
                         }
                         else
                         {
-                            identity = TelemetryDeviceIdentity.SystemBoard(node.Name);
-                            nativeId = identity.DeviceKey;
+                            nativeId = NativeDeviceKey(node.Identifier);
+                            identity = new TelemetryDeviceIdentity(
+                                TelemetryDeviceKind.System, nativeId, node.Name);
                         }
 
                         break;
@@ -241,13 +248,18 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
             return new NodeDevices(assignments, infos);
         }
 
-        private static string ResolveStorageKey(
-            string name,
-            IDictionary<string, int> useCounts)
+        private static string NativeDeviceKey(string identifier) => $"lhm:{identifier}";
+
+        internal static IReadOnlyList<SourceDeviceInfo> DescribeDevicesForTest(
+            IEnumerable<(HardwareType Type, string Name, string Identifier)> hardware)
         {
-            var count = useCounts.TryGetValue(name, out var existing) ? existing : 0;
-            useCounts[name] = count + 1;
-            return count == 0 ? name : $"{name}#{count + 1}";
+            var nodes = hardware
+                .Select(item => new HardwareNode(item.Type, item.Name, item.Identifier))
+                .ToArray();
+            return AssignDeviceIdentities(nodes).Infos
+                .GroupBy(info => info.NativeDeviceId, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToArray();
         }
 
         // LibreHardwareMonitorLib 0.9.6 的 HardwareType 仅含这三类 GPU。
@@ -282,10 +294,11 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
 
         private sealed class HardwareNode
         {
-            public HardwareNode(HardwareType type, string name)
+            public HardwareNode(HardwareType type, string name, string identifier)
             {
                 Type = type;
                 Name = name;
+                Identifier = identifier;
                 Order = NextOrder();
                 Sensors = [];
             }
@@ -293,6 +306,8 @@ namespace AIGeekTuner.Services.Telemetry.LibreHardwareMonitor
             public HardwareType Type { get; }
 
             public string Name { get; }
+
+            public string Identifier { get; }
 
             public int Order { get; }
 

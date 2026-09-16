@@ -128,6 +128,19 @@ namespace AIGeekTuner.Services.AI.Providers.Runtime
             if (profile.Kind == AiProviderKind.OpenAiCompatible)
             {
                 apiKey = await _credentials.LoadAsync(profile.Id, cancellationToken);
+                var credentialOrigin = await _credentials.LoadOriginAsync(profile.Id, cancellationToken);
+                if (apiKey is not null
+                    && credentialOrigin is not null
+                    && AiProviderOrigin.TryNormalize(profile.BaseUrl, out var currentOrigin)
+                    && !string.Equals(
+                        credentialOrigin,
+                        currentOrigin,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // A credential bound to another origin is never silently
+                    // sent to this profile. The user must explicitly replace it.
+                    apiKey = null;
+                }
             }
 
             return new AiRuntimeSnapshot(

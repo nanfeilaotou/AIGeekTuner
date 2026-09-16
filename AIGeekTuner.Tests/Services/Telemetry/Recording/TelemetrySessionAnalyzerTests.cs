@@ -111,6 +111,31 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
         }
 
         [Fact]
+        public void Throttling_UsesCpuKindInsteadOfHardCodedCpuKey()
+        {
+            var cpu = new TelemetryDeviceIdentity(
+                TelemetryDeviceKind.Cpu, "cpu:singleton", "CPU");
+            var samples = new[]
+            {
+                new TelemetrySample(1, T0, 1, [new TelemetryReading(
+                    TelemetryMetricKey.CpuThrottling, 0, TelemetryUnit.Percent,
+                    cpu, TelemetrySourceKind.HwInfo, "raw:throttle", null, T0)]),
+                new TelemetrySample(2, T0.AddSeconds(1), 1, [new TelemetryReading(
+                    TelemetryMetricKey.CpuThrottling, 10, TelemetryUnit.Percent,
+                    cpu, TelemetrySourceKind.HwInfo, "raw:throttle", null, T0.AddSeconds(1))]),
+            };
+            var session = new TelemetryRecordingSession(
+                "cpu-key", T0, T0.AddSeconds(1), 1000, RecordingStatus.Completed,
+                samples, [], null, []);
+
+            var summary = TelemetrySessionAnalyzer.Analyze(session);
+
+            Assert.Contains(summary.TopEvents, @event =>
+                @event.Type == TelemetrySessionEventType.ThrottleObserved
+                && @event.DeviceKey == "cpu:singleton");
+        }
+
+        [Fact]
         public void TwoGpus_StayIsolated_InStatisticsAndChangeDetection()
         {
             // 手工构造每个采样同时含两块 GPU 的温度：gpu:0 稳定、gpu:1 跳变。

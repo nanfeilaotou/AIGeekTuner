@@ -156,6 +156,8 @@ namespace AIGeekTuner.Services.AI.Providers
             }
 
             var snapshot = _store.Snapshot();
+            var existingProfile = snapshot.Profiles.FirstOrDefault(profile =>
+                string.Equals(profile.Id, draft.Id, StringComparison.Ordinal));
             var profiles = snapshot.Profiles
                 .Where(profile => !string.Equals(profile.Id, draft.Id, StringComparison.Ordinal))
                 .Concat(new[] { draft })
@@ -170,7 +172,11 @@ namespace AIGeekTuner.Services.AI.Providers
             try
             {
                 // 1. 先写凭据（DPAPI 加密 + 原子落盘）。
-                var rollbackPlainText = await ApplyCredentialChangeAsync(draft.Id, credentialChange, cancellationToken);
+                var credentialMutation = await ApplyCredentialChangeAsync(
+                    existingProfile,
+                    draft,
+                    credentialChange,
+                    cancellationToken);
 
                 // 2. 再原子写配置；失败则回滚凭据，避免 half-applied。
                 try
@@ -179,7 +185,7 @@ namespace AIGeekTuner.Services.AI.Providers
                 }
                 catch (Exception)
                 {
-                    await RollbackCredentialAsync(draft.Id, rollbackPlainText);
+                    await RollbackCredentialAsync(draft.Id, credentialMutation);
                     throw;
                 }
 
@@ -213,6 +219,7 @@ namespace AIGeekTuner.Services.AI.Providers
             {
                 // 1. 先删凭据；失败则整个删除操作中止，配置保持完整。
                 var oldPlainText = await _credentials.LoadAsync(providerId, cancellationToken);
+                var oldOrigin = await _credentials.LoadOriginAsync(providerId, cancellationToken);
                 await _credentials.DeleteAsync(providerId, cancellationToken);
 
                 // 2. 再原子写“少了一个 Provider”的配置；失败则回滚凭据。
@@ -237,7 +244,11 @@ namespace AIGeekTuner.Services.AI.Providers
                 }
                 catch (Exception)
                 {
-                    await RollbackCredentialAsync(providerId, oldPlainText);
+                    await RollbackCredentialAsync(
+                        providerId,
+                        oldPlainText is null
+                            ? CredentialMutation.None
+                            : new CredentialMutation(true, true, oldPlainText, oldOrigin));
                     throw;
                 }
 
@@ -249,45 +260,117 @@ namespace AIGeekTuner.Services.AI.Providers
             }
         }
 
-        /// <summary>执行凭据变更；返回变更前的明文（用于失败回滚），原来不存在时返回 null。</summary>
-        private async Task<string?> ApplyCredentialChangeAsync(
-            string providerId,
+        /// <summary>
+        /// 执行凭据变更。Changed 与 HadPreviousCredential 分开表达，
+        /// 避免把 KeepExisting 或“原来没有凭据”误当成同一种状态。
+        /// </summary>
+        private async Task<CredentialMutation> ApplyCredentialChangeAsync(
+            AiProviderProfile? existingProfile,
+            AiProviderProfile draft,
             AiCredentialChange change,
             CancellationToken cancellationToken)
         {
+            var providerId = draft.Id;
             switch (change.Mode)
             {
                 case AiCredentialChangeMode.KeepExisting:
-                    return null;
+                    if (existingProfile is null
+                        || existingProfile.Kind != AiProviderKind.OpenAiCompatible
+                        || draft.Kind != AiProviderKind.OpenAiCompatible
+                        || AiProviderOrigin.Equals(existingProfile.BaseUrl, draft.BaseUrl))
+                    {
+                        return CredentialMutation.None;
+                    }
+
+                    return await BindExistingCredentialToOldOriginAsync(
+                        existingProfile,
+                        draft,
+                        cancellationToken);
                 case AiCredentialChangeMode.Replace:
                 {
                     var oldPlainText = await _credentials.LoadAsync(providerId, cancellationToken);
-                    await _credentials.SaveAsync(providerId, change.PlainText!, cancellationToken);
-                    return oldPlainText;
+                    var oldOrigin = await _credentials.LoadOriginAsync(providerId, cancellationToken);
+                    var newOrigin = AiProviderOrigin.TryNormalize(draft.BaseUrl, out var normalized)
+                        ? normalized
+                        : null;
+                    await _credentials.SaveAsync(
+                        providerId, change.PlainText!, newOrigin, cancellationToken);
+                    return new CredentialMutation(
+                        Changed: true,
+                        HadPreviousCredential: oldPlainText is not null,
+                        PreviousPlainText: oldPlainText,
+                        PreviousOrigin: oldOrigin);
                 }
                 case AiCredentialChangeMode.Delete:
                 {
                     var oldPlainText = await _credentials.LoadAsync(providerId, cancellationToken);
+                    var oldOrigin = await _credentials.LoadOriginAsync(providerId, cancellationToken);
                     await _credentials.DeleteAsync(providerId, cancellationToken);
-                    return oldPlainText;
+                    return oldPlainText is null
+                        ? CredentialMutation.None
+                        : new CredentialMutation(true, true, oldPlainText, oldOrigin);
                 }
                 default:
                     throw new InvalidOperationException("未知的凭据变更类型。");
             }
         }
 
-        /// <summary>失败回滚：恢复旧明文；原来没有凭据时删除残留。回滚自身失败只留痕，不掩盖原始错误。</summary>
-        private async Task RollbackCredentialAsync(string providerId, string? oldPlainText)
+        private async Task<CredentialMutation> BindExistingCredentialToOldOriginAsync(
+            AiProviderProfile existingProfile,
+            AiProviderProfile draft,
+            CancellationToken cancellationToken)
         {
+            var oldPlainText = await _credentials.LoadAsync(draft.Id, cancellationToken);
+            if (oldPlainText is null)
+            {
+                return CredentialMutation.None;
+            }
+
+            var oldOrigin = await _credentials.LoadOriginAsync(draft.Id, cancellationToken);
+            var previous = new CredentialMutation(
+                Changed: false,
+                HadPreviousCredential: true,
+                PreviousPlainText: oldPlainText,
+                PreviousOrigin: oldOrigin);
+
+            // KeepExisting on a cross-origin edit must not leave an unbound secret
+            // that the new profile can silently consume. Prefer retaining it with
+            // the old origin; stores without origin metadata fall back to deleting
+            // the credential, which is the safer compatibility behavior.
+            var oldNormalizedOrigin = AiProviderOrigin.TryNormalize(existingProfile.BaseUrl, out var normalized)
+                ? normalized
+                : null;
+            await _credentials.SaveAsync(
+                draft.Id, oldPlainText, oldNormalizedOrigin, cancellationToken);
+            var storedOrigin = await _credentials.LoadOriginAsync(draft.Id, cancellationToken);
+            if (!string.Equals(storedOrigin, oldNormalizedOrigin, StringComparison.OrdinalIgnoreCase))
+            {
+                await _credentials.DeleteAsync(draft.Id, cancellationToken);
+            }
+
+            return previous with { Changed = true };
+        }
+
+        /// <summary>失败回滚：恢复旧明文及其 origin；回滚自身失败只留痕，不掩盖原始错误。</summary>
+        private async Task RollbackCredentialAsync(string providerId, CredentialMutation mutation)
+        {
+            if (!mutation.Changed)
+            {
+                return;
+            }
+
             try
             {
-                if (string.IsNullOrEmpty(oldPlainText))
+                if (!mutation.HadPreviousCredential || mutation.PreviousPlainText is null)
                 {
                     await _credentials.DeleteAsync(providerId);
                 }
                 else
                 {
-                    await _credentials.SaveAsync(providerId, oldPlainText);
+                    await _credentials.SaveAsync(
+                        providerId,
+                        mutation.PreviousPlainText,
+                        mutation.PreviousOrigin);
                 }
             }
             catch (Exception rollbackFailure)
@@ -353,8 +436,32 @@ namespace AIGeekTuner.Services.AI.Providers
         {
             var key = !string.IsNullOrWhiteSpace(plainApiKey)
                 ? plainApiKey
-                : await _credentials.LoadAsync(draft.Id);
+                : await LoadCredentialForDraftAsync(draft);
             return await run(key);
+        }
+
+        private async Task<string?> LoadCredentialForDraftAsync(AiProviderProfile draft)
+        {
+            var existing = GetProfile(draft.Id);
+            if (existing is not null
+                && existing.Kind == AiProviderKind.OpenAiCompatible
+                && draft.Kind == AiProviderKind.OpenAiCompatible
+                && !AiProviderOrigin.Equals(existing.BaseUrl, draft.BaseUrl))
+            {
+                return null;
+            }
+
+            return await _credentials.LoadAsync(draft.Id);
+        }
+
+        private sealed record CredentialMutation(
+            bool Changed,
+            bool HadPreviousCredential,
+            string? PreviousPlainText,
+            string? PreviousOrigin)
+        {
+            public static CredentialMutation None { get; } =
+                new(false, false, null, null);
         }
     }
 }

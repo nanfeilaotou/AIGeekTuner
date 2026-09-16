@@ -195,7 +195,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry
 
             var snapshot = await hub.ReadAsync();
 
-            Assert.Equal(TelemetrySourceStatus.Error,
+            Assert.Equal(TelemetrySourceStatus.Timeout,
                 SingleReport(snapshot, TelemetrySourceKind.HwInfo).Status);
             Assert.Single(snapshot.CanonicalReadings);
         }

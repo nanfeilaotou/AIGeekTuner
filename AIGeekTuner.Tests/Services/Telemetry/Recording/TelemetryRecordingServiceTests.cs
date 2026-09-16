@@ -215,6 +215,89 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
             Assert.Equal(3, finalized.Summary.SampleCount);
             Assert.All(finalized.Summary.Statistics, s => Assert.Equal(100, s.CoveragePercent));
         }
+
+        [Fact]
+        public async Task Finalize_SetsCompletedAtBeforeAnalyze_AndRepeatedStopIsStable()
+        {
+            var snapshots = Enumerable.Range(0, 4).Select(i => new TelemetrySnapshot(
+                T0.AddSeconds(i),
+                [Reading("cpu", "cpu.total.utilization", 40 + i)],
+                [],
+                [])).ToQueue();
+            var service = new TelemetryRecordingService(
+                new FakeHub(snapshots), maxSamplesOverride: 100);
+
+            Assert.True(service.Start(200));
+            await Task.Delay(260);
+            var finalized = await service.StopAsync();
+            var repeated = await service.StopAsync();
+
+            Assert.NotNull(finalized);
+            Assert.Same(finalized, repeated);
+            Assert.True(finalized!.CompletedAtUtc > finalized.StartedAtUtc);
+            Assert.Equal(
+                finalized.CompletedAtUtc.Value - finalized.StartedAtUtc,
+                finalized.Summary!.Duration);
+        }
+
+        [Fact]
+        public async Task StopThenRestart_CreatesNewOwnedRunAndResetsSequence()
+        {
+            var queue = new Queue<TelemetrySnapshot>(
+            [
+                new(T0, [Reading("cpu", "cpu.total.utilization", 20)], [], []),
+                new(T0.AddSeconds(1), [Reading("cpu", "cpu.total.utilization", 30)], [], []),
+            ]);
+            var service = new TelemetryRecordingService(new FakeHub(queue));
+
+            Assert.True(service.Start(200));
+            await WaitUntilAsync(() => service.CurrentSession!.Samples.Count >= 1);
+            var first = await service.StopAsync();
+
+            Assert.True(service.Start(200));
+            await WaitUntilAsync(() => service.CurrentSession!.Samples.Count >= 1);
+            var second = await service.StopAsync();
+
+            Assert.NotNull(first);
+            Assert.NotNull(second);
+            Assert.NotEqual(first!.Id, second!.Id);
+            Assert.Equal(1, second.Samples[0].Sequence);
+        }
+
+        [Fact]
+        public async Task FinalSources_UsesLastKnownSourceState_NotInitialState()
+        {
+            var ready = new TelemetrySourceReport(
+                TelemetrySourceKind.HwInfo, TelemetrySourceStatus.Ready,
+                "ready", 1, T0);
+            var unavailable = new TelemetrySourceReport(
+                TelemetrySourceKind.HwInfo, TelemetrySourceStatus.Unavailable,
+                "gone", 0, null);
+            var queue = new Queue<TelemetrySnapshot>([
+                new(T0, [Reading("cpu", "cpu.total.utilization", 20)], [ready], []),
+                new(T0.AddSeconds(1), [Reading("cpu", "cpu.total.utilization", 30)], [unavailable], []),
+            ]);
+            var service = new TelemetryRecordingService(new FakeHub(queue));
+            var session = TelemetryRecordingSession.Start(1000, T0);
+
+            await service.CaptureOnceAsync(session, CancellationToken.None);
+            await service.CaptureOnceAsync(session, CancellationToken.None);
+            var summary = TelemetrySessionAnalyzer.Analyze(session);
+
+            Assert.Equal(TelemetrySourceStatus.Ready, session.InitialSources.Single().Status);
+            Assert.Equal(TelemetrySourceStatus.Unavailable, summary.FinalSources.Single().Status);
+        }
+
+        private static async Task WaitUntilAsync(Func<bool> predicate)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+            while (!predicate() && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10);
+            }
+
+            Assert.True(predicate());
+        }
     }
 
     internal static class RecordingTestExtensions

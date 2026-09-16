@@ -84,7 +84,10 @@ namespace AIGeekTuner.Services.Incidents
                 PostBuffer: PostBuffer,
                 QueryStatus: result.Status,
                 Channels: result.Channels,
-                Incidents: result.Incidents);
+                Incidents: result.Incidents)
+            {
+                MayBeTruncated = result.MayBeTruncated
+            };
 
             _store.Save(envelope);
             return envelope;

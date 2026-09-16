@@ -44,6 +44,8 @@ namespace AIGeekTuner.ViewModels
                 TelemetrySourceStatus.Unavailable => "○",
                 TelemetrySourceStatus.NeedsConfiguration => "△",
                 TelemetrySourceStatus.Degraded => "◐",
+                TelemetrySourceStatus.Timeout => "◐",
+                TelemetrySourceStatus.Busy => "◐",
                 _ => "✕"
             };
 
@@ -52,6 +54,8 @@ namespace AIGeekTuner.ViewModels
             {
                 TelemetrySourceStatus.Ready => $"已连接 · {report.RawReadingCount} 项",
                 TelemetrySourceStatus.Degraded => $"部分可用 · {report.RawReadingCount} 项",
+                TelemetrySourceStatus.Timeout => report.Message,
+                TelemetrySourceStatus.Busy => report.Message,
                 TelemetrySourceStatus.Unavailable => "未检测到外部数据",
                 TelemetrySourceStatus.NeedsConfiguration => report.Message,
                 _ => "读取失败"

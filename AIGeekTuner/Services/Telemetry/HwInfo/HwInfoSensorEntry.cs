@@ -1,7 +1,12 @@
 namespace AIGeekTuner.Services.Telemetry.HwInfo
 {
     /// <summary>父传感器条目：与官方“传感器元素 + 读数元素”两层结构同构的内部抽象。</summary>
-    public sealed record HwInfoSensorEntry(uint SensorIndex, string SensorName, string? SensorPath = null);
+    public sealed record HwInfoSensorEntry(
+        uint SensorIndex,
+        string SensorName,
+        string? SensorPath = null,
+        uint? SensorId = null,
+        uint? SensorInstance = null);
 
     /// <summary>
     /// 读数条目。<see cref="SensorIndex"/> 只在父传感器内唯一，

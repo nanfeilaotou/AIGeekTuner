@@ -117,8 +117,8 @@ namespace AIGeekTuner.Services.Telemetry.Presentation
                 .Where(reading => reading.Device.Kind == TelemetryDeviceKind.Gpu)
                 .GroupBy(reading => reading.Device.DeviceKey, StringComparer.Ordinal)
                 // 独显在前，iGPU 靠后（与既有排序语义一致）。
-                .OrderBy(group => IsIntelIntegratedGpu(
-                    group.First().Device.DisplayName) ? 1 : 0)
+                .OrderBy(group => ClassifyGpu(group.First().Device.DisplayName)
+                    == GpuIntegrationKind.Integrated ? 1 : 0)
                 .ThenBy(group => group.Key, StringComparer.Ordinal);
 
             foreach (var group in gpuGroups)
@@ -131,7 +131,8 @@ namespace AIGeekTuner.Services.Telemetry.Presentation
                     continue;
                 }
 
-                var isIntel = IsIntelIntegratedGpu(device.DisplayName);
+                var isIntegrated = ClassifyGpu(device.DisplayName)
+                    == GpuIntegrationKind.Integrated;
                 var byMetric = group
                     .GroupBy(reading => reading.MetricKey.Value, StringComparer.Ordinal)
                     .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
@@ -143,7 +144,7 @@ namespace AIGeekTuner.Services.Telemetry.Presentation
                 var coreTemp = Get(byMetric, TelemetryMetricKey.GpuCoreTemperature);
                 var utilization = Get(byMetric, TelemetryMetricKey.GpuCoreUtilization);
 
-                if (!isIntel)
+                if (!isIntegrated)
                 {
                     if (coreTemp is not null)
                     {
@@ -235,9 +236,42 @@ namespace AIGeekTuner.Services.Telemetry.Presentation
             }
         }
 
-        /// <summary>§9：Intel iGPU 显示排序靠后（独立 iGPU 卡）。</summary>
+        public enum GpuIntegrationKind
+        {
+            Unknown,
+            Integrated,
+            Discrete,
+        }
+
+        /// <summary>
+        /// 厂商与集成属性分开判断。只有常见 Intel UHD/Iris/HD 名称被
+        /// 识别为集成；Intel Arc 明确是独立显卡，其余名称保持 unknown。
+        /// </summary>
+        public static GpuIntegrationKind ClassifyGpu(string displayName)
+        {
+            if (!displayName.Contains("intel", StringComparison.OrdinalIgnoreCase))
+            {
+                return GpuIntegrationKind.Unknown;
+            }
+
+            if (displayName.Contains("arc", StringComparison.OrdinalIgnoreCase))
+            {
+                return GpuIntegrationKind.Discrete;
+            }
+
+            if (displayName.Contains("uhd", StringComparison.OrdinalIgnoreCase)
+                || displayName.Contains("iris", StringComparison.OrdinalIgnoreCase)
+                || displayName.Contains("hd graphics", StringComparison.OrdinalIgnoreCase))
+            {
+                return GpuIntegrationKind.Integrated;
+            }
+
+            return GpuIntegrationKind.Unknown;
+        }
+
+        /// <summary>兼容旧调用方的 Intel iGPU 判断。</summary>
         public static bool IsIntelIntegratedGpu(string displayName) =>
-            displayName.Contains("intel", StringComparison.OrdinalIgnoreCase);
+            ClassifyGpu(displayName) == GpuIntegrationKind.Integrated;
 
         private static string ShortGpuName(string displayName)
         {

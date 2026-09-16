@@ -201,6 +201,43 @@ namespace AIGeekTuner.Tests.Services.Hardware.Inventory
         }
 
         [Fact]
+        public async Task Refresh_InvalidatesSnapshot_WhileCollectReusesIt()
+        {
+            var wmi = new FakeWmiSource();
+            wmi.Tables["Win32_Processor"] = [Row(("Name", "CPU-A"))];
+            var service = new HardwareInventoryService(
+                wmi, new FakeGpuSource(), new FakeAudioSource(),
+                new FakeDisplaySource(), new FakeNetworkSource());
+
+            var first = await service.CollectAsync();
+            var reused = await service.CollectAsync();
+            wmi.Tables["Win32_Processor"] = [Row(("Name", "CPU-B"))];
+            var refreshed = await service.RefreshAsync();
+
+            Assert.Same(first, reused);
+            Assert.Equal("CPU-A", first.Cpu!.Name);
+            Assert.Equal("CPU-B", refreshed.Cpu!.Name);
+        }
+
+        [Fact]
+        public async Task Invalidate_AllowsExplicitRefreshWithoutPermanentStaleSnapshot()
+        {
+            var wmi = new FakeWmiSource();
+            wmi.Tables["Win32_Processor"] = [Row(("Name", "CPU-A"))];
+            var service = new HardwareInventoryService(
+                wmi, new FakeGpuSource(), new FakeAudioSource(),
+                new FakeDisplaySource(), new FakeNetworkSource());
+
+            await service.CollectAsync();
+            wmi.Tables["Win32_Processor"] = [Row(("Name", "CPU-C"))];
+            service.Invalidate();
+
+            var refreshed = await service.CollectAsync();
+
+            Assert.Equal("CPU-C", refreshed.Cpu!.Name);
+        }
+
+        [Fact]
         public async Task IndependentCategories_CollectInParallel()
         {
             var wmi = new ParallelWmiSource();

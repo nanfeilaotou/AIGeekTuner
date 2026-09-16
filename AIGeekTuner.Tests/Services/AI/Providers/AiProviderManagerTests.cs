@@ -4,6 +4,7 @@ using AIGeekTuner.Configuration;
 using AIGeekTuner.Services.AI.Providers;
 using AIGeekTuner.Services.AI.Providers.Configuration;
 using AIGeekTuner.Services.AI.Providers.Credentials;
+using AIGeekTuner.Services.AI.Providers.Runtime;
 using AIGeekTuner.Services.AI.Providers.Transport;
 using AIGeekTuner.Tests.TestSupport;
 using Xunit;
@@ -34,12 +35,12 @@ public sealed class AiProviderManagerTests : IDisposable
         _manager = new AiProviderManager(_store, _credentials, openAi, ollama);
     }
 
-    private static AiProviderProfile LmStudioDraft() => new()
+    private static AiProviderProfile LmStudioDraft(string? baseUrl = null) => new()
     {
         Id = "lmstudio",
         DisplayName = "LM Studio",
         Kind = AiProviderKind.OpenAiCompatible,
-        BaseUrl = "http://127.0.0.1:1234/v1",
+        BaseUrl = baseUrl ?? "http://127.0.0.1:1234/v1",
         Models = new[] { new AiProviderModel("llama-3.1-8b") },
         DefaultModelId = "llama-3.1-8b",
         StructuredOutputMode = AiStructuredOutputMode.OpenAiJsonSchema
@@ -215,6 +216,134 @@ public sealed class AiProviderManagerTests : IDisposable
         Assert.False(result.Success);
         Assert.Null(await _credentials.LoadAsync("lmstudio"));
         Assert.Empty(Directory.GetFiles(_temp.FullPath, "ai-providers.json"));
+    }
+
+    [Fact]
+    public async Task Save_ConfigWriteFails_KeepExisting_PreservesExistingCredential()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-keep"));
+        var failingManager = new AiProviderManager(
+            new FailingSaveProviderStore(_store.Snapshot()),
+            _credentials,
+            new OpenAiCompatibleClient(new HttpClient(_handler)),
+            new OllamaNativeClient(new HttpClient(new StubAiHttpHandler())));
+
+        var result = await failingManager.SaveProfileAsync(
+            LmStudioDraft(), AiCredentialChange.Keep);
+
+        Assert.False(result.Success);
+        Assert.Equal("sk-keep", await _credentials.LoadAsync("lmstudio"));
+    }
+
+    [Fact]
+    public async Task Save_ConfigWriteFails_KeepExisting_WithNoCredential_StaysMissing()
+    {
+        var failingManager = new AiProviderManager(
+            new FailingSaveProviderStore(new AiProviderConfiguration
+            {
+                Profiles = [LmStudioDraft()]
+            }),
+            _credentials,
+            new OpenAiCompatibleClient(new HttpClient(_handler)),
+            new OllamaNativeClient(new HttpClient(new StubAiHttpHandler())));
+
+        var result = await failingManager.SaveProfileAsync(
+            LmStudioDraft(), AiCredentialChange.Keep);
+
+        Assert.False(result.Success);
+        Assert.Null(await _credentials.LoadAsync("lmstudio"));
+    }
+
+    [Fact]
+    public async Task Save_ConfigWriteFails_Replace_RestoresOldCredential()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-before"));
+        var failingManager = new AiProviderManager(
+            new FailingSaveProviderStore(_store.Snapshot()),
+            _credentials,
+            new OpenAiCompatibleClient(new HttpClient(_handler)),
+            new OllamaNativeClient(new HttpClient(new StubAiHttpHandler())));
+
+        var result = await failingManager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-after"));
+
+        Assert.False(result.Success);
+        Assert.Equal("sk-before", await _credentials.LoadAsync("lmstudio"));
+    }
+
+    [Fact]
+    public async Task Save_ConfigWriteFails_Delete_RestoresOldCredential()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-before-delete"));
+        var failingManager = new AiProviderManager(
+            new FailingSaveProviderStore(_store.Snapshot()),
+            _credentials,
+            new OpenAiCompatibleClient(new HttpClient(_handler)),
+            new OllamaNativeClient(new HttpClient(new StubAiHttpHandler())));
+
+        var result = await failingManager.SaveProfileAsync(
+            LmStudioDraft(), new AiCredentialChange(AiCredentialChangeMode.Delete));
+
+        Assert.False(result.Success);
+        Assert.Equal("sk-before-delete", await _credentials.LoadAsync("lmstudio"));
+    }
+
+    [Fact]
+    public async Task UnsavedCrossOriginDraft_DoesNotReuseStoredCredential_OnRealTransport()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-old-origin"));
+        _handler.EnqueueSuccessJson("""{ "choices": [ { "message": { } } ] }""");
+        var changed = LmStudioDraft("https://new.example.invalid/v2");
+
+        var result = await _manager.TestConnectionAsync(changed);
+
+        Assert.NotEqual(AiConnectionTestStatus.AuthenticationFailed, result.Status);
+        Assert.Null(Assert.Single(_handler.Requests).Authorization);
+    }
+
+    [Fact]
+    public async Task SavedCrossOriginKeep_BindsOldOrigin_AndRuntimeSnapshotOmitsKey()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-old-origin"));
+        await _manager.SetActiveProviderAsync("lmstudio");
+        var changed = LmStudioDraft("https://new.example.invalid/v2");
+
+        var saved = await _manager.SaveProfileAsync(changed, AiCredentialChange.Keep);
+        var source = new AiRuntimeSnapshotSource(_store, _credentials);
+        var snapshot = await source.TryCaptureAsync(30);
+
+        Assert.True(saved.Success);
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.ApiKey);
+        Assert.Equal("http://127.0.0.1:1234", await _credentials.LoadOriginAsync("lmstudio"));
+    }
+
+    [Fact]
+    public async Task SavedSameOriginPathChange_ReusesCredential()
+    {
+        await _manager.SaveProfileAsync(
+            LmStudioDraft(),
+            new AiCredentialChange(AiCredentialChangeMode.Replace, "sk-same-origin"));
+        await _manager.SetActiveProviderAsync("lmstudio");
+        var changedPath = LmStudioDraft("http://127.0.0.1:1234/v2");
+
+        var saved = await _manager.SaveProfileAsync(changedPath, AiCredentialChange.Keep);
+        var snapshot = await new AiRuntimeSnapshotSource(_store, _credentials)
+            .TryCaptureAsync(30);
+
+        Assert.True(saved.Success);
+        Assert.Equal("sk-same-origin", snapshot!.ApiKey);
     }
 
     [Fact]

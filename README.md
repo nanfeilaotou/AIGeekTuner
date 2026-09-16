@@ -4,6 +4,8 @@
 
 导入故障日志，结合本机真实硬件信息，由当前 AI Provider 生成结构化诊断结论；硬件采集、历史存储与 SafetyGuard 在本机完成，云端 Provider 会接收所配置的诊断上下文。
 
+当前首发范围仅为 **Windows 10/11 x64（win-x64）**。正式包采用 **self-contained .NET 8 WPF**，目标机无需预装 .NET Desktop Runtime；请完整解压发布 ZIP 后运行，不要单独分发 `bin/Release` 里的 exe。详见 [Release 说明](docs/RELEASE.md)。
+
 ## Features
 
 - 硬件信息采集（CPU / GPU / 内存 / 磁盘 / 操作系统，基于 WMI）
@@ -65,11 +67,11 @@ Provider 未启动或模型缺失、请求超时、AI 输出/grounding 无效、
 
 ## Optional Telemetry Sources (V2-M1)
 
-AIGeekTuner 可读取可用的外部硬件监控数据，并保留数据来源；外部软件为可选项，未安装时内置传感器功能完全正常。
+AIGeekTuner 可读取可用的外部硬件监控数据，并保留数据来源；外部软件为可选项，未安装时应用仍可启动，相关来源会显示未检测到或需要配置。内置传感器也受硬件、驱动、权限与可选 PawnIO 低层访问能力限制。
 
 | 来源 | 方式 | 说明 |
 | --- | --- | --- |
-| LibreHardwareMonitor | 内置 | 默认来源，无需额外安装 |
+| LibreHardwareMonitor | 内置库 | 默认来源；某些低层主板/CPU 传感器取决于 PawnIO、驱动与权限。缺少时降级为部分/无传感器数据，不影响应用启动 |
 | AIDA64 | WMI（Root\WMI\AIDA64_SensorValues） | 可选；需在 AIDA64 External Applications 中启用 |
 | HWiNFO | Shared Memory（7.0+ SM2 接口，官方已完全公开） | 可选；需用户安装 HWiNFO 并启用 Shared Memory Support。免费版连续共享约 12 小时后自动停用、需手动重开；AIGeekTuner 不捆绑 HWiNFO，也不会以任何方式规避该时限 |
 
@@ -77,6 +79,8 @@ AIGeekTuner 可读取可用的外部硬件监控数据，并保留数据来源�
 - 同一物理设备的识别基于证据（强 ID / 单例 / 归一化名称唯一匹配）；证据不足的设备保留来源本地身份，不做跨源回退。
 - 同一指标按固定优先级（HWiNFO → AIDA64 → LibreHardwareMonitor）选择单一来源，不做多源平均，并保留来源溯源。
 - Hardware 页与 Settings 页可查看各数据源状态。
+- 当前为避免 LibreHardwareMonitor 0.9.6 的 Intel GPU 组合枚举风险，CPU 与 GPU 使用分离实例；Intel 集显实时指标可能不完整或缺失，不承诺所有 Intel GPU/LHM 传感器可用。
+- 不需要、也不建议为传感器读取关闭 Defender、SmartScreen、内存完整性、驱动签名或其它 Windows 安全能力。
 
 ## Diagnostic Recording (V2-M2)
 
@@ -86,7 +90,10 @@ AIGeekTuner 可读取可用的外部硬件监控数据，并保留数据来源�
 - 只记录 canonical 核心指标与多设备实例，保留来源溯源（含 HWiNFO→AIDA64→LibreHardwareMonitor 的来源切换）
 - 统计：Min / Avg / Max / P50 / P95 / P99 与覆盖率
 - 关键变化事件（温度 ≥5°C、利用率 ≥30pp、频率/功耗相对+绝对阈值、CPU throttling、来源切换、采样缺口）
-- 本地存储于 `Sessions/{id}/session.json`（原子写入）
+- 正常点击 Stop 并完成 Finalize 后，本地存储于 `%LOCALAPPDATA%/AI-GeekTuner/Sessions/{id}/session.json`（原子写入）
+- 当前不是 crash-safe / BSOD black-box recorder；异常断电、蓝屏、进程崩溃或强制结束可能丢失当前尚未 finalize 的整个 Session
+
+Session AI 的 Provider 输出会先经过本地 SafetyGuard；页面展示、持久化内容与最终 TTS 文本使用 SafetyGuard 后的同一版本。已完成语音随 Session 持久存在并在重新打开时复用，删除 Session 才会清理对应语音。
 
 ## Tests
 
@@ -102,32 +109,34 @@ dotnet test
 
 ### Requirements
 
-- Windows 10 / 11
+- Windows 10 / 11 x64（win-x64；不承诺 x86 / ARM64）
 - 已在设置中配置并激活可用的 AI Provider（使用 Ollama 时需安装并运行 [Ollama](https://ollama.com)）
 - 使用 Ollama 时推荐模型：`ollama pull qwen3:8b`
-- .NET 8 Desktop Runtime（仅 framework-dependent 发布产物需要）
+- 官方首发包为 self-contained，无需另外安装 .NET Desktop Runtime
 
 ### 从源码运行
 
 ```bash
-git clone <repo>
-cd AIGeekTuner
+git clone https://github.com/nanfeilaotou/ai_geek_tuner.git
+cd ai_geek_tuner
 dotnet run --project AIGeekTuner/AIGeekTuner.csproj
 ```
 
 ### 发布产物
 
-发布与演示说明见 [docs/DEMO.md](docs/DEMO.md)。
+下载 `AIGeekTuner-2.0.0-win-x64.zip`，完整解压后运行 `AIGeekTuner.exe`。发布方式、文件清单、可选依赖和干净机验收见 [docs/RELEASE.md](docs/RELEASE.md)；演示流程见 [docs/DEMO.md](docs/DEMO.md)。
 
 ## Privacy
 
-硬件采集、日志读取、SafetyGuard 与历史记录在本机完成。AI 推理请求按“当前使用”的 Provider 发送：使用本地 Provider 时可保持本地处理；使用云端 Provider 时，诊断上下文将发送至该 Provider，并按其凭据与隐私政策处理。
+硬件采集、日志读取、SafetyGuard 与历史记录在本机完成。AI 推理请求只发送到当前保存并激活的 Provider `BaseUrl`：使用 `localhost` Provider 时可保持本机处理；使用局域网或互联网 Provider 时，故障日志、用户描述、硬件/Session 摘要及相关证据会发送到该地址，并按该服务的日志、保留与隐私政策处理。应用不承诺“完全本地”或“绝对隐私”。
 
 ## Limitations
 
 - 当前支持 Ollama Native 与 OpenAI Compatible Provider（可配置 LM Studio、llama.cpp、DeepSeek 等服务）
 - 诊断建议为辅助参考，不替代专业硬件维修
 - WMI / LibreHardwareMonitor 的部分字段取决于硬件、驱动与管理员权限，读不到就以“未检测到”呈现，不会伪造
+- AIDA64、HWiNFO、PawnIO、AI Provider、GPT-SoVITS 与音频输出均为可选能力；缺失时对应功能降级，不代表所有硬件都受支持
+- 发布包当前未配置代码签名；目标机器是否允许运行取决于其 Windows/组织策略，不应关闭安全能力绕过
 - 不执行任何 BIOS / 超频 / 电压修改操作
 - 不解析 Minidump 二进制文件
 - AI 可能判断错误：请结合 confidence、事实与推测分区自行判断

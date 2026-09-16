@@ -13,6 +13,14 @@ namespace AIGeekTuner.Services.Incidents
         long? RecordId,
         string? Message);
 
+    public sealed record WindowsEventQueryTarget(
+        string ProviderName,
+        IReadOnlyList<int>? EventIds = null);
+
+    public sealed record WindowsEventReadResult(
+        IReadOnlyList<RawWindowsEvent> Events,
+        bool MayBeTruncated);
+
     /// <summary>
     /// 只负责“读取 raw event records”的最小 seam（Gate D）：
     /// 单层抽象，测试用 fake 提供记录，不做 IPlatform/IRepository 套娃。
@@ -26,5 +34,23 @@ namespace AIGeekTuner.Services.Incidents
             DateTimeOffset endUtc,
             int maxResults,
             CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Filtered/status-aware seam. Legacy test readers can use the default
+        /// behavior; the Windows implementation pushes targets into XPath and
+        /// reports whether maxResults cut off more records.
+        /// </summary>
+        async Task<WindowsEventReadResult> ReadDetailedAsync(
+            string channel,
+            DateTimeOffset startUtc,
+            DateTimeOffset endUtc,
+            int maxResults,
+            IReadOnlyList<WindowsEventQueryTarget> targets,
+            CancellationToken cancellationToken)
+        {
+            var events = await ReadAsync(
+                channel, startUtc, endUtc, maxResults, cancellationToken);
+            return new WindowsEventReadResult(events, MayBeTruncated: false);
+        }
     }
 }

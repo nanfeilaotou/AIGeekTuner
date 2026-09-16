@@ -57,11 +57,13 @@ namespace AIGeekTuner.Tests.Services.Telemetry
                 byMember[(TelemetrySourceKind.Aida64, "gpu:1")]);
             Assert.StartsWith("src:", byMember[(TelemetrySourceKind.LibreHardwareMonitor, "gpu:1")]);
 
-            // CPU：三源各一（HWiNFO 已折叠变体）→ 无矛盾单例合并。
+            // CPU：HWiNFO + LHM 有唯一名称包含证据；AIDA 只有匿名占位，
+            // 保守保持独立，不能仅因“每源一个”就挂靠。
             var cpuKey = byMember[(TelemetrySourceKind.HwInfo, "cpu")];
-            Assert.Equal("cpu:singleton", cpuKey);
+            Assert.StartsWith("cpu:name:", cpuKey);
             Assert.Equal(cpuKey, byMember[(TelemetrySourceKind.LibreHardwareMonitor, "cpu")]);
-            Assert.Equal(cpuKey, byMember[(TelemetrySourceKind.Aida64, "cpu")]);
+            Assert.NotEqual(cpuKey, byMember[(TelemetrySourceKind.Aida64, "cpu")]);
+            Assert.StartsWith("src:Aida64:", byMember[(TelemetrySourceKind.Aida64, "cpu")]);
         }
 
         [Fact]

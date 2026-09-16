@@ -93,7 +93,10 @@ namespace AIGeekTuner.Models.Incidents
         string Channel,
         IncidentQueryStatus Status,
         string? StatusMessage,
-        int IncidentCount);
+        int IncidentCount)
+    {
+        public bool MayBeTruncated { get; init; }
+    }
 
     /// <summary>合并后的查询结果：按时间升序、去重、EvidenceId 稳定（incident:0001 起）。</summary>
     public sealed record IncidentQueryResult(
@@ -101,5 +104,7 @@ namespace AIGeekTuner.Models.Incidents
         IReadOnlyList<IncidentChannelResult> Channels)
     {
         public IncidentQueryStatus Status { get; init; } = IncidentQueryStatus.Success;
+
+        public bool MayBeTruncated { get; init; }
     }
 }

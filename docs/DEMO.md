@@ -1,6 +1,6 @@
 # AIGeekTuner 演示脚本（约 5 分钟）
 
-> 演示前检查：已在设置中配置并激活可用的 AI Provider；使用 Ollama 时确保服务正在运行并已执行 `ollama pull qwen3:8b`，应用为 Release 发布目录下的 exe。
+> 演示前检查：使用完整解压的 `AIGeekTuner-2.0.0-win-x64` self-contained 发布包；已在设置中配置并激活可用的 AI Provider；使用 Ollama 时确保服务正在运行并已执行 `ollama pull qwen3:8b`。不要从 `bin/Release` 或 ZIP 内直接运行单独的 exe。
 
 ## 1. 首页（30 秒）
 
@@ -68,6 +68,10 @@ Provider 的结构化 JSON 模式约束输出；解析器容忍围栏/噪声并�
 ### Ollama 没开会怎样？
 
 开始诊断前有 readiness 预检：离线或模型缺失都会得到明确中文提示，界面不会崩溃也不会假死。
+
+### Session 录制能在蓝屏或断电后恢复吗？
+
+不能承诺。当前只有正常 Stop/Finalize 后才持久化；它不是 crash-safe / BSOD black-box recorder，未 finalize 的 Session 在异常断电、蓝屏或进程崩溃时可能全部丢失。
 
 ### 为什么不用数据库？
 

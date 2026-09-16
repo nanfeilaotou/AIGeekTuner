@@ -121,7 +121,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
         }
 
         [Fact]
-        public void Delete_RemovesDirectory()
+    public void Delete_RemovesDirectory()
         {
             var store = new TelemetrySessionStore(_dir);
             store.Save(Sample("del"));
@@ -129,6 +129,149 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
             Assert.True(store.Delete("del"));
             Assert.False(store.Delete("del"));
             Assert.Null(store.Load("del"));
+        }
+
+        [Fact]
+        public void MaliciousIds_NeverEscapeSessionRoot()
+        {
+            var store = new TelemetrySessionStore(_dir);
+            var ids = new[]
+            {
+                "..",
+                "../escape",
+                "..\\escape",
+                "C:\\outside",
+                "C:relative",
+                "\\root-relative",
+                "\\\\server\\share",
+                "\\\\?\\C:\\device",
+                "name:stream",
+                "name.",
+                "name ",
+                "CON",
+                "PRN",
+                "AUX",
+                "NUL",
+                "COM1",
+                "LPT9",
+                "/tmp/outside",
+                "nested/name",
+            };
+
+            foreach (var id in ids)
+            {
+                Assert.Null(store.Load(id));
+                Assert.False(store.Delete(id));
+                Assert.Throws<ArgumentException>(() => store.PathOf(id));
+            }
+
+            Assert.False(File.Exists(Path.Combine(_dir, "escape", "session.json")));
+        }
+
+        [Fact]
+        public void Load_RejectsDirectoryAndJsonIdentityMismatch()
+        {
+            var store = new TelemetrySessionStore(_dir);
+            store.Save(Sample("json-id"));
+            Directory.Move(
+                Path.Combine(_dir, "json-id"),
+                Path.Combine(_dir, "directory-id"));
+
+            Assert.Null(store.Load("directory-id"));
+            Assert.Empty(store.LoadAll(out var errors));
+            Assert.Contains("directory-id", errors);
+        }
+
+        [Fact]
+        public void RootBoundary_IsStrict_AndTargetRootIsRejected()
+        {
+            var root = Path.Combine(_dir, "Sessions");
+            Directory.CreateDirectory(root);
+
+            Assert.False(SessionPathGuard.IsWithinRoot(root, root));
+            Assert.True(SessionPathGuard.IsWithinRoot(root, Path.Combine(root, "abc")));
+            Assert.False(SessionPathGuard.IsWithinRoot(root, root + "2"));
+            Assert.False(SessionPathGuard.TryGetSessionDirectory(root, ".", out _));
+        }
+
+        [Fact]
+        public void ReparseSessionDirectory_IsRejectedAndNeverRecursivelyDeleted()
+        {
+            var store = new TelemetrySessionStore(_dir);
+            var outside = Path.Combine(
+                Path.GetTempPath(),
+                "aigt-reparse-outside-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(outside);
+            File.WriteAllText(Path.Combine(outside, "sentinel.txt"), "keep");
+            var link = Path.Combine(_dir, "linked");
+
+            try
+            {
+                Directory.CreateSymbolicLink(link, outside);
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException
+                                               or IOException
+                                               or PlatformNotSupportedException)
+            {
+                return;
+            }
+
+            try
+            {
+                Assert.Null(store.Load("linked"));
+                Assert.False(store.Delete("linked"));
+                Assert.True(File.Exists(Path.Combine(outside, "sentinel.txt")));
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(link))
+                    {
+                        Directory.Delete(link);
+                    }
+                }
+                catch
+                {
+                    // TempDirectory cleanup remains best effort.
+                }
+
+                try
+                {
+                    if (Directory.Exists(outside))
+                    {
+                        Directory.Delete(outside, recursive: true);
+                    }
+                }
+                catch
+                {
+                    // TempDirectory cleanup remains best effort.
+                }
+            }
+        }
+
+        [Fact]
+        public void LoadMetadata_ReadsHistoryFieldsWithoutReturningFullSessions()
+        {
+            var store = new TelemetrySessionStore(_dir);
+            store.Save(Sample("metadata") with
+            {
+                CompletedAtUtc = new DateTimeOffset(2024, 1, 1, 0, 0, 2, TimeSpan.Zero),
+                Samples = Enumerable.Range(1, 100)
+                    .Select(i => new TelemetrySample(
+                        i,
+                        DateTimeOffset.UtcNow,
+                        1,
+                        Array.Empty<TelemetryReading>()))
+                    .ToArray()
+            });
+
+            var metadata = store.LoadMetadata(out var errors);
+
+            Assert.Empty(errors);
+            var item = Assert.Single(metadata);
+            Assert.Equal("metadata", item.Id);
+            Assert.Equal(100, item.SampleCount);
         }
     }
 }

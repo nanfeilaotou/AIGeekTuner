@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using AIGeekTuner.Models.Sessions;
 using AIGeekTuner.Services.Telemetry.Recording;
 using AIGeekTuner.Tests.TestSupport;
 using Xunit;
@@ -97,7 +98,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
         /// 绝不允许“UI 显示已生成、播放却拿不到 bytes”的分叉规则。
         /// </summary>
         [Fact]
-        public void HasCachedVoice_True_Implies_TryLoadVoiceWav_SucceedsWithDiskBytes()
+    public void HasCachedVoice_True_Implies_TryLoadVoiceWav_SucceedsWithDiskBytes()
         {
             var wav = TestWav.Create();
             _store.SaveVoiceWav("s-contract", wav);
@@ -126,5 +127,107 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Recording
             Assert.True(_store.HasCachedVoice("s-config"));
             Assert.Equal(wav, _store.TryLoadVoiceWav("s-config"));
         }
+
+        [Fact]
+        public void AnalysisReplacement_InvalidatesOldVoiceIdentity_WithoutDeletingIt()
+        {
+            var first = Envelope("s-version", T0, "first spoken");
+            _store.Save(first);
+            var wav = TestWav.Create();
+            _store.SaveVoiceWav("s-version", wav);
+            var firstIdentity = _store.TryGetAnalysisIdentity("s-version");
+            Assert.NotNull(firstIdentity);
+
+            Assert.True(_store.HasCachedVoice("s-version", firstIdentity!));
+            Assert.Equal(wav, _store.TryLoadVoiceWav("s-version", firstIdentity!));
+
+            var second = Envelope("s-version", T0.AddSeconds(1), "new spoken");
+            _store.Save(second);
+            var secondIdentity = _store.TryGetAnalysisIdentity("s-version");
+            Assert.NotNull(secondIdentity);
+
+            Assert.NotEqual(firstIdentity, secondIdentity);
+            Assert.False(_store.HasCachedVoice("s-version", secondIdentity!));
+            Assert.Null(_store.TryLoadVoiceWav("s-version", secondIdentity!));
+            Assert.True(_store.HasCachedVoice("s-version"));
+            Assert.Equal(wav, _store.TryLoadVoiceWav("s-version"));
+        }
+
+        [Fact]
+        public void StaleVoiceCommit_IsRejected_AndExistingCacheIsUntouched()
+        {
+            _store.Save(Envelope("s-stale", T0, "first"));
+            var firstIdentity = _store.TryGetAnalysisIdentity("s-stale");
+            Assert.NotNull(firstIdentity);
+            var firstWav = TestWav.Create();
+            _store.SaveVoiceWav("s-stale", firstWav, firstIdentity!);
+
+            _store.Save(Envelope("s-stale", T0.AddSeconds(1), "second"));
+            var secondIdentity = _store.TryGetAnalysisIdentity("s-stale");
+            Assert.NotNull(secondIdentity);
+            var staleWav = TestWav.Create();
+            staleWav[12] = 0xCC;
+
+            Assert.False(_store.TrySaveVoiceWav("s-stale", staleWav, firstIdentity!));
+            Assert.False(_store.HasCachedVoice("s-stale", secondIdentity!));
+            Assert.Equal(firstWav, _store.TryLoadVoiceWav("s-stale"));
+            Assert.DoesNotContain(
+                Directory.EnumerateFiles(Path.Combine(_temp.FullPath, "s-stale")),
+                path => Path.GetFileName(path).Contains(".voice.", StringComparison.Ordinal));
+        }
+
+        [Fact]
+        public void DeletingSessionDirectory_RemovesItsVoiceCache()
+        {
+            var sessionStore = new TelemetrySessionStore(_temp.FullPath);
+            sessionStore.Save(TelemetryRecordingSession.Start(1000, T0) with
+            {
+                Id = "s-delete",
+                Status = RecordingStatus.Completed,
+                CompletedAtUtc = T0.AddSeconds(1),
+            });
+            _store.Save(Envelope("s-delete", T0, "spoken"));
+            _store.SaveVoiceWav("s-delete", TestWav.Create());
+
+            Assert.True(_store.VoiceWavExists("s-delete"));
+            Assert.True(sessionStore.Delete("s-delete"));
+            Assert.False(_store.VoiceWavExists("s-delete"));
+            Assert.False(File.Exists(Path.Combine(
+                _temp.FullPath, "s-delete", "voice.wav.meta.json")));
+        }
+        [Fact]
+        public void AnalysisPaths_RejectTraversalAndRootedIds()
+        {
+            foreach (var id in new[] { "../escape", "..\\escape", "C:\\outside", "/tmp/outside" })
+            {
+                Assert.Null(_store.Load(id));
+                Assert.False(_store.AnalysisExists(id));
+                Assert.Throws<ArgumentException>(() => _store.VoiceWavPathOf(id));
+            }
+        }
+
+        private static SessionAnalysisEnvelope Envelope(
+            string sessionId,
+            DateTimeOffset analyzedAt,
+            string spoken) =>
+            new(
+                1,
+                sessionId,
+                analyzedAt,
+                "test-model",
+                1,
+                false,
+                new SessionAnalysisResult(
+                    "summary",
+                    SessionOverallAssessment.Normal,
+                    0.9,
+                    [],
+                    [],
+                    [],
+                    spoken),
+                "{}" );
+
+        private static readonly DateTimeOffset T0 =
+            new(2026, 9, 15, 0, 0, 0, TimeSpan.Zero);
     }
 }

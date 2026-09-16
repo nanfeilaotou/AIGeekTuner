@@ -6,6 +6,78 @@ using AIGeekTuner.Services.Diagnostics;
 
 namespace AIGeekTuner.Services.Hardware.Inventory
 {
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PropertyKey
+    {
+        public Guid FormatId;
+        public int PropertyId;
+    }
+
+    /// <summary>
+    /// Native PROPVARIANT payload members whose ABI size depends on pointer size.
+    /// The leading uint plus natural pointer alignment is 8 bytes on x86 and
+    /// 16 bytes on x64, matching BLOB/CA* payloads in propidl.h.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PropVariantCountedPointer
+    {
+        public uint Count;
+        public IntPtr Pointer;
+    }
+
+    /// <summary>Native DECIMAL overlay used by the outer PROPVARIANT union.</summary>
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct PropVariantDecimal
+    {
+        [FieldOffset(0)] public ushort Reserved;
+        [FieldOffset(2)] public byte Scale;
+        [FieldOffset(3)] public byte Sign;
+        [FieldOffset(4)] public uint High;
+        [FieldOffset(8)] public ulong Low;
+    }
+
+    /// <summary>
+    /// Native PROPVARIANT value union. It includes the scalar, pointer and
+    /// counted-pointer shapes needed to give the union its complete ABI extent.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct PropVariantValue
+    {
+        [FieldOffset(0)] public sbyte SignedByte;
+        [FieldOffset(0)] public byte Byte;
+        [FieldOffset(0)] public short Int16;
+        [FieldOffset(0)] public ushort UInt16;
+        [FieldOffset(0)] public int Int32;
+        [FieldOffset(0)] public uint UInt32;
+        [FieldOffset(0)] public long Int64;
+        [FieldOffset(0)] public ulong UInt64;
+        [FieldOffset(0)] public float Single;
+        [FieldOffset(0)] public double Double;
+        [FieldOffset(0)] public IntPtr Pointer;
+        [FieldOffset(0)] public PropVariantCountedPointer CountedPointer;
+    }
+
+    /// <summary>
+    /// ABI-faithful PROPVARIANT header plus value union. Natural layout yields
+    /// 16 bytes on x86 and 24 bytes on x64; the value union always starts at 8.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct PropVariant
+    {
+        [FieldOffset(0)] public ushort VariantType;
+        [FieldOffset(2)] public ushort Reserved1;
+        [FieldOffset(4)] public ushort Reserved2;
+        [FieldOffset(6)] public ushort Reserved3;
+        [FieldOffset(8)] public PropVariantValue Value;
+        [FieldOffset(0)] public PropVariantDecimal DecimalValue;
+
+        public IntPtr PointerValue => Value.Pointer;
+    }
+
+    internal delegate int PropertyValueGetter(ref PropertyKey key, out PropVariant value);
+    internal delegate string? PropVariantStringConverter(IntPtr pointer);
+    internal delegate int PropVariantClearer(ref PropVariant value);
+
     /// <summary>
     /// Gate I：Core Audio MMDevice 枚举（playback/capture endpoint + default 标记）。
     /// 只读枚举；不做音量/切换/测试。失败返回空集（Gate M）。
@@ -86,29 +158,16 @@ namespace AIGeekTuner.Services.Hardware.Inventory
             int Commit();
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct PropertyKey
-        {
-            public Guid FormatId;
-            public int PropertyId;
-        }
-
-        [StructLayout(LayoutKind.Explicit)]
-        private struct PropVariant
-        {
-            [FieldOffset(0)] public ushort VariantType;
-            [FieldOffset(8)] public IntPtr PointerValue;
-        }
-
         [DllImport("ole32.dll")]
         private static extern int PropVariantClear(ref PropVariant variant);
 
         public IReadOnlyList<AudioInventoryMapper.EndpointDescriptor> GetEndpoints()
         {
             var results = new List<AudioInventoryMapper.EndpointDescriptor>();
+            IMMDeviceEnumerator? enumerator = null;
             try
             {
-                var enumerator = (IMMDeviceEnumerator)(object)new MMDeviceEnumeratorCom();
+                enumerator = (IMMDeviceEnumerator)(object)new MMDeviceEnumeratorCom();
                 var defaultIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 CollectDefaultIds(enumerator, defaultIds);
 
@@ -119,22 +178,44 @@ namespace AIGeekTuner.Services.Hardware.Inventory
             {
                 ExceptionLogWriter.Write(exception, "Inventory/CoreAudio");
             }
+            finally
+            {
+                ReleaseComObject(enumerator);
+            }
 
             return results;
         }
 
         private static void CollectDefaultIds(IMMDeviceEnumerator enumerator, HashSet<string> ids)
         {
-            if (enumerator.GetDefaultAudioEndpoint((int)EDataFlow.eRender, 0, out var render) == 0
-                && render is not null)
+            IMMDevice? render = null;
+            try
             {
-                AddDefaultId(render, ids);
+                if (HResultSucceeded(enumerator.GetDefaultAudioEndpoint(
+                        (int)EDataFlow.eRender, 0, out render))
+                    && render is not null)
+                {
+                    AddDefaultId(render, ids);
+                }
+            }
+            finally
+            {
+                ReleaseComObject(render);
             }
 
-            if (enumerator.GetDefaultAudioEndpoint((int)EDataFlow.eCapture, 0, out var capture) == 0
-                && capture is not null)
+            IMMDevice? capture = null;
+            try
             {
-                AddDefaultId(capture, ids);
+                if (HResultSucceeded(enumerator.GetDefaultAudioEndpoint(
+                        (int)EDataFlow.eCapture, 0, out capture))
+                    && capture is not null)
+                {
+                    AddDefaultId(capture, ids);
+                }
+            }
+            finally
+            {
+                ReleaseComObject(capture);
             }
         }
 
@@ -142,7 +223,7 @@ namespace AIGeekTuner.Services.Hardware.Inventory
         {
             try
             {
-                if (device.GetId(out var id) == 0 && id is not null)
+                if (HResultSucceeded(device.GetId(out var id)) && id is not null)
                 {
                     ids.Add(id);
                 }
@@ -159,7 +240,7 @@ namespace AIGeekTuner.Services.Hardware.Inventory
             List<AudioInventoryMapper.EndpointDescriptor> results,
             HashSet<string> defaultIds)
         {
-            if (enumerator.EnumAudioEndpoints((int)flow, DeviceStateActive, out var collection) != 0
+            if (HResultFailed(enumerator.EnumAudioEndpoints((int)flow, DeviceStateActive, out var collection))
                 || collection is null)
             {
                 return;
@@ -167,21 +248,21 @@ namespace AIGeekTuner.Services.Hardware.Inventory
 
             try
             {
-                if (collection.GetCount(out var count) != 0)
+                if (HResultFailed(collection.GetCount(out var count)))
                 {
                     return;
                 }
 
                 for (var index = 0; index < count; index++)
                 {
-                    if (collection.Item(index, out var device) != 0 || device is null)
+                    if (HResultFailed(collection.Item(index, out var device)) || device is null)
                     {
                         continue;
                     }
 
                     try
                     {
-                        if (device.GetId(out var id) != 0 || id is null)
+                        if (HResultFailed(device.GetId(out var id)) || id is null)
                         {
                             continue;
                         }
@@ -204,19 +285,19 @@ namespace AIGeekTuner.Services.Hardware.Inventory
                     }
                     finally
                     {
-                        Marshal.ReleaseComObject(device);
+                        ReleaseComObject(device);
                     }
                 }
             }
             finally
             {
-                Marshal.ReleaseComObject(collection);
+                ReleaseComObject(collection);
             }
         }
 
         private static string? ReadFriendlyName(IMMDevice device)
         {
-            if (device.OpenPropertyStore(0 /* STGM_READ */, out var properties) != 0
+            if (HResultFailed(device.OpenPropertyStore(0 /* STGM_READ */, out var properties))
                 || properties is null)
             {
                 return null;
@@ -229,18 +310,38 @@ namespace AIGeekTuner.Services.Hardware.Inventory
             }
             finally
             {
-                Marshal.ReleaseComObject(properties);
+                ReleaseComObject(properties);
             }
         }
 
         private static string? ReadProperty(IPropertyStore properties, int propertyId)
         {
+            return ReadPropertyValue(
+                properties.GetValue,
+                propertyId,
+                Marshal.PtrToStringUni,
+                ClearPropVariant);
+        }
+
+        internal static int ClearPropVariant(ref PropVariant value) =>
+            PropVariantClear(ref value);
+
+        internal static string? ReadPropertyValue(
+            PropertyValueGetter getValue,
+            int propertyId,
+            PropVariantStringConverter convertString,
+            PropVariantClearer clear)
+        {
+            ArgumentNullException.ThrowIfNull(getValue);
+            ArgumentNullException.ThrowIfNull(convertString);
+            ArgumentNullException.ThrowIfNull(clear);
+
             var key = new PropertyKey
             {
                 FormatId = DeviceFriendlyNameKey,
                 PropertyId = propertyId,
             };
-            if (properties.GetValue(ref key, out var variant) != 0)
+            if (HResultFailed(getValue(ref key, out var variant)))
             {
                 return null;
             }
@@ -249,12 +350,30 @@ namespace AIGeekTuner.Services.Hardware.Inventory
             {
                 // VT_LPWSTR = 31
                 return variant.VariantType == 31 && variant.PointerValue != IntPtr.Zero
-                    ? HardwarePlaceholderFilter.Sanitize(Marshal.PtrToStringUni(variant.PointerValue))
+                    ? HardwarePlaceholderFilter.Sanitize(convertString(variant.PointerValue))
                     : null;
             }
             finally
             {
-                PropVariantClear(ref variant);
+                clear(ref variant);
+            }
+        }
+
+        internal static int ExpectedPropVariantSize(int pointerSize) => pointerSize switch
+        {
+            4 => 16,
+            8 => 24,
+            _ => throw new ArgumentOutOfRangeException(nameof(pointerSize)),
+        };
+
+        private static bool HResultSucceeded(int hresult) => hresult >= 0;
+        private static bool HResultFailed(int hresult) => hresult < 0;
+
+        private static void ReleaseComObject(object? value)
+        {
+            if (value is not null && Marshal.IsComObject(value))
+            {
+                Marshal.ReleaseComObject(value);
             }
         }
 

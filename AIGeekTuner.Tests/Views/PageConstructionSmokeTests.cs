@@ -2,6 +2,7 @@ using System.IO;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using AIGeekTuner.Configuration;
 using AIGeekTuner.Services.AI;
 using AIGeekTuner.Services.AI.Providers;
@@ -61,6 +62,84 @@ public class PageConstructionSmokeTests
 
         Assert.True(failure is null,
             "页面构造失败：" + failure?.GetType().Name + " | " + failure?.Message);
+    }
+
+    [Fact]
+    public void SessionsPage_AttachesDeleteConfirmationAfterMainWindowSetsDataContext()
+    {
+        Exception? failure = null;
+
+        var thread = new Thread(() =>
+        {
+            AIGeekTuner.MainWindow? window = null;
+            try
+            {
+                EnsureThemeResources();
+                window = new AIGeekTuner.MainWindow();
+                window.Show();
+                var shell = Assert.IsType<AIGeekTuner.ViewModels.MainWindowViewModel>(window.DataContext);
+                shell.ShowSessionsCommand.Execute(null);
+                Dispatcher.CurrentDispatcher.Invoke(
+                    DispatcherPriority.Background, new Action(() => { }));
+                var frame = Assert.IsType<Frame>(window.FindName("MainFrame"));
+                var page = Assert.IsType<AIGeekTuner.Views.SessionsPage>(frame.Content);
+                page.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+
+                var viewModel = Assert.IsType<AIGeekTuner.ViewModels.SessionsViewModel>(page.DataContext);
+                Assert.NotNull(viewModel.ConfirmDelete);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                window?.Close();
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(60)), "页面生命周期测试超时");
+        Assert.Null(failure);
+    }
+
+    [Fact]
+    public void FrameNavigationService_BoundsJournalForRepeatedPageCreation()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var frame = new Frame();
+                var window = new Window { Content = frame };
+                window.Show();
+                var navigation = new AIGeekTuner.Services.Navigation.FrameNavigationService(
+                    frame,
+                    (page, _) => new Page());
+                for (var i = 0; i < 12; i++)
+                {
+                    navigation.NavigateTo(AIGeekTuner.Services.Navigation.AppPage.Dashboard);
+                    Dispatcher.CurrentDispatcher.Invoke(
+                        DispatcherPriority.Background, new Action(() => { }));
+                }
+
+                Assert.True(navigation.CanGoBack);
+                navigation.GoBack();
+                Assert.False(navigation.CanGoBack);
+                window.Close();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "导航生命周期测试超时");
+        Assert.Null(failure);
     }
 
     [Fact]

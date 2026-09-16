@@ -45,11 +45,108 @@ namespace AIGeekTuner.Services.Telemetry
         IReadOnlyList<SourceDeviceInfo> Members);
 
     /// <summary>
+    /// Process-local identity memory. It never persists across app restarts and
+    /// only remembers source-native members that were reliably reconciled during
+    /// this running live/recording lifetime.
+    /// </summary>
+    internal sealed class TelemetryDeviceLifetimeMap
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<(TelemetrySourceKind Source, string NativeId), LifetimeDevice>
+            _bySourceMember = new();
+
+        public DeviceReconciliationLookup Resolve(
+            IReadOnlyList<CanonicalDeviceGroup> provisionalGroups)
+        {
+            ArgumentNullException.ThrowIfNull(provisionalGroups);
+
+            lock (_gate)
+            {
+                var current = new Dictionary<
+                    (TelemetrySourceKind Source, string NativeId),
+                    TelemetryDeviceIdentity>();
+
+                foreach (var group in provisionalGroups)
+                {
+                    var existing = group.Members
+                        .Select(member => _bySourceMember.GetValueOrDefault(
+                            (member.Source, member.NativeDeviceId)))
+                        .Where(device => device is not null)
+                        .Cast<LifetimeDevice>()
+                        .Distinct()
+                        .ToArray();
+
+                    if (existing.Length == 0)
+                    {
+                        var created = new LifetimeDevice(new TelemetryDeviceIdentity(
+                            group.Kind,
+                            group.CanonicalKey,
+                            group.DisplayName));
+                        AttachAll(group.Members, created, current);
+                    }
+                    else if (existing.Length == 1)
+                    {
+                        // Current high-confidence reconciliation connects a new
+                        // source-native member to one already-stable identity.
+                        AttachAll(group.Members, existing[0], current);
+                    }
+                    else
+                    {
+                        // Never collapse two identities that were already distinct.
+                        // Ambiguous new members stay separate instead of choosing a side.
+                        foreach (var member in group.Members)
+                        {
+                            if (!_bySourceMember.TryGetValue(
+                                    (member.Source, member.NativeDeviceId),
+                                    out var lifetime))
+                            {
+                                lifetime = new LifetimeDevice(new TelemetryDeviceIdentity(
+                                    member.Kind,
+                                    SourceLocalCanonicalKey(member),
+                                    DisplayName(member)));
+                                _bySourceMember[(member.Source, member.NativeDeviceId)] = lifetime;
+                            }
+
+                            current[(member.Source, member.NativeDeviceId)] = lifetime.Identity;
+                        }
+                    }
+                }
+
+                return new DeviceReconciliationLookup(current);
+            }
+        }
+
+        private void AttachAll(
+            IEnumerable<SourceDeviceInfo> members,
+            LifetimeDevice lifetime,
+            IDictionary<(TelemetrySourceKind, string), TelemetryDeviceIdentity> current)
+        {
+            foreach (var member in members)
+            {
+                _bySourceMember[(member.Source, member.NativeDeviceId)] = lifetime;
+                current[(member.Source, member.NativeDeviceId)] = lifetime.Identity;
+            }
+        }
+
+        private static string SourceLocalCanonicalKey(SourceDeviceInfo member) =>
+            $"{member.Kind.ToString().ToLowerInvariant()}:src:{member.Source}:{member.NativeDeviceId}";
+
+        private static string DisplayName(SourceDeviceInfo member) =>
+            string.IsNullOrWhiteSpace(member.NativeDeviceName)
+                ? member.Kind.ToString()
+                : member.NativeDeviceName;
+
+        private sealed class LifetimeDevice(TelemetryDeviceIdentity identity)
+        {
+            public TelemetryDeviceIdentity Identity { get; } = identity;
+        }
+    }
+
+    /// <summary>
     /// 设备 Reconciliation（§14/§15/§16）：只回答“这些是不是同一块物理硬件”，
     /// 绝不做 metric mapping。证据从强到弱：
     /// 1) StrongIds 精确匹配（serial / PCI 身份等，当前各来源尚未提供，规则已就绪）；
-    /// 2) 单例规则：所有报告了该 Kind 设备的 Provider 都恰好报了 1 个 → 无歧义合并；
-    /// 3) 归一化名称唯一双射：名称归一后完全相等，且每个 Provider 在该 Kind 下至多贡献一个成员、
+    /// 2) 归一化名称唯一双射：名称归一后完全相等，且每个 Provider 在该 Kind 下至多贡献一个成员、
     ///    且该归一名在其来源内唯一（同型号双卡因此不会被合并）；
     /// 其余一律保持源本地命名空间（src:{source}:{nativeId}），宁可不合并也不错并。
     /// Ordinal 永远不参与合并判定。
@@ -97,35 +194,7 @@ namespace AIGeekTuner.Services.Telemetry
 
                 pending = pending.Where(device => !mergedFlags.Contains(device)).ToList();
 
-                // ---- 2) 单例规则：所有报告该 Kind 的 Provider 都恰好报 1 个，
-                //         且已提供的非空归一名称互不矛盾（防止“AIDA 只见 iGPU、
-                //         HWiNFO 只见 dGPU”的部分可见被误判成单卡）----
-                var bySource = pending
-                    .GroupBy(device => device.Source)
-                    .ToArray();
-                var nonEmptyNames = pending
-                    .Select(device => NormalizeName(device.NativeDeviceName))
-                    .Where(name => name.Length > 0)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-                var namesConsistent = nonEmptyNames.Count <= 1;
-                // 名称矛盾守卫只对 GPU 生效：iGPU/dGPU 部分可见是真实风险；
-                // 存储/内存的盘名标签差异不代表身份矛盾。
-                var guardApplies = kindGroup.Key == TelemetryDeviceKind.Gpu;
-                if (bySource.Length >= 2
-                    && bySource.All(sourceGroup => sourceGroup.Count() == 1)
-                    && (namesConsistent || !guardApplies))
-                {
-                    var members = bySource.Select(group => group.First()).ToArray();
-                    result.Add(CreateGroup(
-                        kindGroup.Key,
-                        "singleton",
-                        members));
-                    continue; // 该 Kind 已整体合并
-                }
-
-                // ---- 3) 归一化名称匹配：先精确相等分组；再做“互为唯一包含”配对 ----
-                var formedGroups = new List<CanonicalDeviceGroup>();
+                // ---- 2) 归一化名称匹配：先精确相等分组；再做“互为唯一包含”配对 ----
                 var exactGroups = pending
                     .GroupBy(device => NormalizeName(device.NativeDeviceName),
                         StringComparer.OrdinalIgnoreCase)
@@ -143,7 +212,6 @@ namespace AIGeekTuner.Services.Telemetry
                         kindGroup.Key,
                         $"name:{Sanitize(nameGroup.Key)}",
                         members);
-                    formedGroups.Add(group);
                     result.Add(group);
                     foreach (var member in members)
                     {
@@ -214,43 +282,10 @@ namespace AIGeekTuner.Services.Telemetry
                         kindGroup.Key,
                         $"name:{Sanitize(NormalizeName(members[0].NativeDeviceName))}",
                         members);
-                    formedGroups.Add(group);
                     result.Add(group);
                     foreach (var member in members)
                     {
                         mergedFlags.Add(member);
-                    }
-                }
-
-                pending = pending.Where(device => !mergedFlags.Contains(device)).ToList();
-
-                // ---- 其余：保持源本地命名空间；但空名设备（来源不提供型号名）
-                // 在“本轮恰好只形成一个多成员组”时允许挂靠——无矛盾证据。----
-                var emptyNamed = pending
-                    .Where(device => NormalizeName(device.NativeDeviceName).Length == 0)
-                    .ToList();
-                // 仅当“恰好一个空名设备 + 恰好一个合并组”时才挂靠；
-                // 多个空名（如 AIDA 同时给出 GPU#1/GPU#2）无法定位，保持源本地。
-                if (emptyNamed.Count == 1
-                    && formedGroups.Count == 1
-                    && formedGroups[0].Members.All(member => member.Source != emptyNamed[0].Source))
-                {
-                    var target = formedGroups[0];
-                    var members = target.Members.ToList();
-                    members.AddRange(emptyNamed);
-                    result.Remove(target);
-                    result.Add(new CanonicalDeviceGroup(
-                        target.Kind,
-                        target.CanonicalKey,
-                        members
-                            .Select(member => member.NativeDeviceName.Trim())
-                            .Where(name => name.Length > 0)
-                            .OrderByDescending(name => name.Length)
-                            .FirstOrDefault() ?? target.DisplayName,
-                        members));
-                    foreach (var emptyDevice in emptyNamed)
-                    {
-                        mergedFlags.Add(emptyDevice);
                     }
                 }
 

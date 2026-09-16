@@ -24,8 +24,8 @@ namespace AIGeekTuner.Services.Telemetry
 
         private static readonly TimeSpan DefaultPerProviderTimeout = TimeSpan.FromSeconds(8);
 
-        private readonly ITelemetryProvider[] _providers;
-        private readonly TimeSpan _perProviderTimeout;
+        private readonly ProviderReadSlot[] _providerSlots;
+        private readonly TelemetryDeviceLifetimeMap _deviceLifetimeMap = new();
 
         public TelemetryHub(
             IEnumerable<ITelemetryProvider> providers,
@@ -44,13 +44,21 @@ namespace AIGeekTuner.Services.Telemetry
                     nameof(providers));
             }
 
-            _providers = FixedPriorityOrder
+            var orderedProviders = FixedPriorityOrder
                 .Select(kind => materialized
                     .FirstOrDefault(provider => provider.SourceKind == kind))
                 .Where(provider => provider is not null)
                 .Cast<ITelemetryProvider>()
                 .ToArray();
-            _perProviderTimeout = perProviderTimeout ?? DefaultPerProviderTimeout;
+            var timeout = perProviderTimeout ?? DefaultPerProviderTimeout;
+            if (timeout <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(perProviderTimeout));
+            }
+
+            _providerSlots = orderedProviders
+                .Select(provider => new ProviderReadSlot(provider, timeout))
+                .ToArray();
         }
 
         public async Task<TelemetrySnapshot> ReadAsync(
@@ -58,21 +66,21 @@ namespace AIGeekTuner.Services.Telemetry
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var tasks = _providers
-                .Select(provider => ReadIsolatedAsync(provider, cancellationToken))
+            var tasks = _providerSlots
+                .Select(slot => slot.ReadWithinDeadlineAsync(cancellationToken))
                 .ToArray();
-            // ReadIsolatedAsync 只在“外层取消”时抛出，业务失败一律降级为 Error 报告。
+            // Provider 槽只在“外层取消”时抛出，业务失败一律降级为来源报告。
             await Task.WhenAll(tasks);
 
             var outcomes = new Dictionary<TelemetrySourceKind, ProviderOutcome>();
-            for (var i = 0; i < _providers.Length; i++)
+            for (var i = 0; i < _providerSlots.Length; i++)
             {
-                outcomes[_providers[i].SourceKind] = await tasks[i];
+                outcomes[_providerSlots[i].SourceKind] = await tasks[i];
             }
 
             // 设备 Reconciliation（§14）：跨源设备合并只依据证据；
             // 未合并的源本地设备保留独立命名空间，绝不因 ordinal 相同而互通。
-            var reconciliation = TelemetryDeviceReconciler.ToLookup(
+            var reconciliation = _deviceLifetimeMap.Resolve(
                 ReconcileDevices(outcomes));
 
             var canonicalReadings =
@@ -195,41 +203,6 @@ namespace AIGeekTuner.Services.Telemetry
             return reports;
         }
 
-        private async Task<ProviderOutcome> ReadIsolatedAsync(
-            ITelemetryProvider provider,
-            CancellationToken outerToken)
-        {
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(outerToken);
-            linkedCts.CancelAfter(_perProviderTimeout);
-            var stopwatch = Stopwatch.StartNew();
-
-            try
-            {
-                var result = await provider.ReadSnapshotAsync(linkedCts.Token);
-                stopwatch.Stop();
-                return ProviderOutcome.From(result, stopwatch.ElapsedMilliseconds);
-            }
-            catch (OperationCanceledException)
-                when (outerToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (OperationCanceledException exception)
-            {
-                stopwatch.Stop();
-                Log(provider, exception, "timed out");
-                return ProviderOutcome.TimeoutFailure(
-                    $"读取超时（>{_perProviderTimeout.TotalSeconds:0.#} 秒）。",
-                    stopwatch.ElapsedMilliseconds);
-            }
-            catch (Exception exception)
-            {
-                stopwatch.Stop();
-                Log(provider, exception, "failed");
-                return ProviderOutcome.RuntimeFailure("读取失败。", stopwatch.ElapsedMilliseconds);
-            }
-        }
-
         private static void Log(
             ITelemetryProvider provider,
             Exception exception,
@@ -237,6 +210,142 @@ namespace AIGeekTuner.Services.Telemetry
             ExceptionLogWriter.Write(
                 exception,
                 $"Telemetry/{provider.SourceKind} {verb}");
+
+        /// <summary>
+        /// Provider-scoped single flight. A deadline ends only the caller's wait;
+        /// an uncooperative native read remains the sole occupant until it really
+        /// completes, at which point the continuation observes and releases it.
+        /// </summary>
+        private sealed class ProviderReadSlot
+        {
+            private readonly object _gate = new();
+            private readonly ITelemetryProvider _provider;
+            private readonly TimeSpan _timeout;
+            private ProviderOperation? _inFlight;
+
+            public ProviderReadSlot(ITelemetryProvider provider, TimeSpan timeout)
+            {
+                _provider = provider;
+                _timeout = timeout;
+            }
+
+            public TelemetrySourceKind SourceKind => _provider.SourceKind;
+
+            public async Task<ProviderOutcome> ReadWithinDeadlineAsync(
+                CancellationToken outerToken)
+            {
+                outerToken.ThrowIfCancellationRequested();
+
+                ProviderOperation operation;
+                lock (_gate)
+                {
+                    if (_inFlight is { Task.IsCompleted: false } current)
+                    {
+                        outerToken.ThrowIfCancellationRequested();
+                        return ProviderOutcome.Busy(
+                            "上一次底层读取仍在进行；本轮未启动重复读取。",
+                            ElapsedMilliseconds(current.StartTimestamp));
+                    }
+
+                    operation = StartOperation();
+                    _inFlight = operation;
+                }
+
+                ObserveAndRelease(operation);
+
+                try
+                {
+                    var result = await operation.Task
+                        .WaitAsync(_timeout, outerToken)
+                        .ConfigureAwait(false);
+                    return ProviderOutcome.From(
+                        result,
+                        ElapsedMilliseconds(operation.StartTimestamp));
+                }
+                catch (OperationCanceledException) when (outerToken.IsCancellationRequested)
+                {
+                    TryCancel(operation.Cancellation);
+                    throw;
+                }
+                catch (TimeoutException exception)
+                {
+                    TryCancel(operation.Cancellation);
+                    Log(_provider, exception, "wait timed out");
+                    return ProviderOutcome.TimeoutFailure(
+                        $"读取等待超时（>{_timeout.TotalSeconds:0.#} 秒）；底层任务可能仍在结束。",
+                        ElapsedMilliseconds(operation.StartTimestamp));
+                }
+                catch (OperationCanceledException exception)
+                {
+                    Log(_provider, exception, "timed out");
+                    return ProviderOutcome.TimeoutFailure(
+                        $"读取超时（>{_timeout.TotalSeconds:0.#} 秒）。",
+                        ElapsedMilliseconds(operation.StartTimestamp));
+                }
+                catch (Exception exception)
+                {
+                    Log(_provider, exception, "failed");
+                    return ProviderOutcome.RuntimeFailure(
+                        "读取失败。",
+                        ElapsedMilliseconds(operation.StartTimestamp));
+                }
+            }
+
+            private ProviderOperation StartOperation()
+            {
+                var cancellation = new CancellationTokenSource();
+                cancellation.CancelAfter(_timeout);
+                var started = Stopwatch.GetTimestamp();
+                var task = Task.Run(
+                    async () => await _provider
+                        .ReadSnapshotAsync(cancellation.Token)
+                        .ConfigureAwait(false),
+                    CancellationToken.None);
+                return new ProviderOperation(task, cancellation, started);
+            }
+
+            private void ObserveAndRelease(ProviderOperation operation)
+            {
+                _ = operation.Task.ContinueWith(
+                    completed =>
+                    {
+                        // Observe late faults after a caller-side timeout.
+                        _ = completed.Exception;
+                        lock (_gate)
+                        {
+                            if (ReferenceEquals(_inFlight, operation))
+                            {
+                                _inFlight = null;
+                            }
+                        }
+
+                        operation.Cancellation.Dispose();
+                    },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+
+            private static void TryCancel(CancellationTokenSource cancellation)
+            {
+                try
+                {
+                    cancellation.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Completion may win the race and dispose the slot CTS.
+                }
+            }
+
+            private static long ElapsedMilliseconds(long startedTimestamp) =>
+                (long)Stopwatch.GetElapsedTime(startedTimestamp).TotalMilliseconds;
+
+            private sealed record ProviderOperation(
+                Task<TelemetryProviderResult> Task,
+                CancellationTokenSource Cancellation,
+                long StartTimestamp);
+        }
 
         private sealed record ProviderOutcome(
             TelemetrySourceStatus Status,
@@ -253,7 +362,10 @@ namespace AIGeekTuner.Services.Telemetry
                 new(result.Status, result.Message, result.RawReadings.Count, result, durationMs);
 
             public static ProviderOutcome TimeoutFailure(string message, long durationMs) =>
-                new(TelemetrySourceStatus.Error, message, 0, null, durationMs);
+                new(TelemetrySourceStatus.Timeout, message, 0, null, durationMs);
+
+            public static ProviderOutcome Busy(string message, long durationMs) =>
+                new(TelemetrySourceStatus.Busy, message, 0, null, durationMs);
 
             public static ProviderOutcome RuntimeFailure(string message, long durationMs) =>
                 new(TelemetrySourceStatus.Error, message, 0, null, durationMs);

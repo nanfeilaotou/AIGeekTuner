@@ -14,6 +14,7 @@ using AIGeekTuner.Services.Incidents;
 using AIGeekTuner.Services.Dialogs;
 using AIGeekTuner.Services.Diagnostics;
 using AIGeekTuner.Services.SessionAnalysis;
+using AIGeekTuner.Services.Safety;
 using AIGeekTuner.Services.Settings;
 using AIGeekTuner.Services.Voice;
 using AIGeekTuner.Services.Telemetry.Recording;
@@ -247,7 +248,8 @@ namespace AIGeekTuner.ViewModels
             ISessionIncidentCorrelationService incidentCorrelation,
             ISessionIncidentStore incidentStore,
             ISessionExportService? sessionExportService = null,
-            IFileDialogService? fileDialogs = null)
+            IFileDialogService? fileDialogs = null,
+            ISafetyService? safetyService = null)
         {
             _recorder = recorder ?? throw new ArgumentNullException(nameof(recorder));
             _store = store ?? throw new ArgumentNullException(nameof(store));
@@ -261,6 +263,7 @@ namespace AIGeekTuner.ViewModels
             _incidentStore = incidentStore ?? throw new ArgumentNullException(nameof(incidentStore));
             _sessionExportService = sessionExportService;
             _fileDialogs = fileDialogs;
+            _safetyService = safetyService ?? new SafetyGuardService();
 
             // M4.5E.3 Gate E：app 在 UI 线程构造 ViewModel → 捕获 Dispatcher 同步上下文；
             // 单元测试/无 WPF 宿主下可能为 null → UI 回退为内联执行（RunOnUiThread）。
@@ -372,6 +375,7 @@ namespace AIGeekTuner.ViewModels
         // ---- V2-M3：AI 分析 ----
         private readonly ISessionAnalysisService _analysisService;
         private readonly ISessionAnalysisStore _analysisStore;
+        private readonly ISafetyService _safetyService;
         private bool _isAnalyzing;
         private bool _hasAnalysis;
         private string _assessmentBadge = string.Empty;
@@ -383,6 +387,8 @@ namespace AIGeekTuner.ViewModels
         // M4.5E.2 Gate C：进行中的分析操作属于发起时的目标会话。
         // 当前只允许一个并发分析（最小设计，不造 TaskRegistry）。
         private string? _activeAnalysisSessionId;
+        private CancellationTokenSource? _analysisCancellation;
+        private long _sessionOperationVersion;
 
         public ObservableCollection<AnalysisFindingRow> Findings { get; } = [];
         public ObservableCollection<string> Recommendations { get; } = [];
@@ -430,6 +436,7 @@ namespace AIGeekTuner.ViewModels
         // M4.5E.2 Gate J：进行中的语音操作（生成/播放）属于发起时的目标会话，
         // 只影响该会话的显示；用户切到其它会话时绝不污染。
         private string? _activeVoiceSessionId;
+        private CancellationTokenSource? _voiceCancellation;
 
         // M4.5E.3 Gate E：ViewModel 在组合根（UI 线程）构造——捕获该线程的同步上下文，
         // 后台语音回调的唯一 UI 状态回写通道。绝不依赖 Application.Current（曾因并行
@@ -457,6 +464,11 @@ namespace AIGeekTuner.ViewModels
                 return;
             }
 
+            Interlocked.Increment(ref _sessionOperationVersion);
+            CancelAnalysis();
+            CancelVoiceOperation();
+            _activeAnalysisSessionId = null;
+            _activeVoiceSessionId = null;
             _currentSessionId = sessionId;
             AnalyzeCommand.NotifyCanExecuteChanged();
             ExportSessionReportCommand.NotifyCanExecuteChanged();
@@ -466,6 +478,14 @@ namespace AIGeekTuner.ViewModels
             OnPropertyChanged(nameof(IsCurrentDetailAnalyzing));
             OnPropertyChanged(nameof(IsCurrentDetailVoiceBusy));
             OnPropertyChanged(nameof(VoiceStateText));
+        }
+
+        /// <summary>页面离开时取消只属于页面/当前会话的后台 AI 工作。</summary>
+        public void OnPageExited()
+        {
+            Interlocked.Increment(ref _sessionOperationVersion);
+            CancelAnalysis();
+            CancelVoiceOperation();
         }
 
         public RelayCommand PlaySpokenSummaryCommand { get; }
@@ -534,7 +554,12 @@ namespace AIGeekTuner.ViewModels
                     return _voiceFailureText ?? "语音预生成失败，播放时会重试";
                 }
 
-                if (CurrentDetailSessionId is not null && _analysisStore.HasCachedVoice(CurrentDetailSessionId))
+                var analysisIdentity = CurrentDetailSessionId is null
+                    ? null
+                    : _analysisStore.TryGetAnalysisIdentity(CurrentDetailSessionId);
+                if (analysisIdentity is not null
+                    && CurrentDetailSessionId is { } detailSessionId
+                    && _analysisStore.HasCachedVoice(detailSessionId, analysisIdentity))
                 {
                     return "语音已生成 · 播放将直接使用缓存";
                 }
@@ -618,6 +643,28 @@ namespace AIGeekTuner.ViewModels
             var analysis = _analysisStore.Load(session.Id);
             if (analysis is not null)
             {
+                // Re-apply the common SafetyGuard when opening legacy or
+                // externally restored analysis.json files. This keeps the
+                // persisted/UI/TTS path safe even if the file predates the
+                // Session-AI post-processing step.
+                var safe = _safetyService.ValidateSessionAsync(analysis.Result)
+                    .GetAwaiter()
+                    .GetResult();
+                if (safe.WasTransformed)
+                {
+                    var sanitized = analysis with { Result = safe.Result };
+                    try
+                    {
+                        _analysisStore.Save(sanitized);
+                        analysis = sanitized;
+                    }
+                    catch (Exception exception)
+                    {
+                        ExceptionLogWriter.Write(exception, "SessionAnalysis safety migration");
+                        analysis = sanitized;
+                    }
+                }
+
                 RenderAnalysis(
                     analysis.Result,
                     analysis.ModelName,
@@ -733,6 +780,14 @@ namespace AIGeekTuner.ViewModels
                 HasIncidentQualityText = true;
             }
 
+            if (envelope.MayBeTruncated)
+            {
+                IncidentQualityText = string.IsNullOrWhiteSpace(IncidentQualityText)
+                    ? "事件查询达到读取上限，结果可能不完整"
+                    : IncidentQualityText + "；事件查询达到读取上限，结果可能不完整";
+                HasIncidentQualityText = true;
+            }
+
             if (envelope.Incidents.Count == 0)
             {
                 // 与“未采集”必须区分：采集过，但窗口内没有已识别事件。
@@ -825,47 +880,32 @@ namespace AIGeekTuner.ViewModels
             }
 
             SyncFromRecorder();
-            var session = _recorder.CurrentSession;
-            if (session is null)
+            var snapshot = _recorder.LiveSnapshot;
+            if (snapshot is null)
             {
                 return;
             }
 
-            ElapsedText = FormatDuration(DateTimeOffset.UtcNow - session.StartedAtUtc);
-            SamplesText = session.Samples.Count.ToString("N0");
-            IntervalText = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{session.RequestedIntervalMs / 1000d:0.#} s");
-
-            var aggregate = new Dictionary<string, (double Cur, double Min, double Max, TelemetryUnit Unit)>(StringComparer.Ordinal);
-            foreach (var sample in session.Samples)
-            {
-                foreach (var reading in sample.Readings)
-                {
-                    var label = LabelOf(reading);
-                    if (!aggregate.TryGetValue(label, out var entry))
-                    {
-                        aggregate[label] = (reading.Value, reading.Value, reading.Value, reading.Unit);
-                    }
-                    else
-                    {
-                        aggregate[label] = (reading.Value, Math.Min(entry.Min, reading.Value), Math.Max(entry.Max, reading.Value), reading.Unit);
-                    }
-                }
-            }
+            ElapsedText = FormatDuration(DateTimeOffset.UtcNow - snapshot.StartedAtUtc);
+            SamplesText = snapshot.SampleCount.ToString("N0");
+            IntervalText = string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"{snapshot.RequestedIntervalMs / 1000d:0.#} s");
 
             LiveMetrics.Clear();
-            foreach (var kvp in aggregate)
+            foreach (var metric in snapshot.Metrics)
             {
                 LiveMetrics.Add(new LiveMetricRow(
-                    kvp.Key,
-                    TelemetrySessionAnalyzer.FormatValue(kvp.Value.Cur, kvp.Value.Unit),
-                    TelemetrySessionAnalyzer.FormatValue(kvp.Value.Min, kvp.Value.Unit),
-                    TelemetrySessionAnalyzer.FormatValue(kvp.Value.Max, kvp.Value.Unit)));
+                    metric.Label,
+                    TelemetrySessionAnalyzer.FormatValue(metric.Current, metric.Unit),
+                    TelemetrySessionAnalyzer.FormatValue(metric.Minimum, metric.Unit),
+                    TelemetrySessionAnalyzer.FormatValue(metric.Maximum, metric.Unit)));
             }
         }
 
         public void LoadRecent()
         {
-            var sessions = _store.LoadAll(out _);
+            var sessions = _store.LoadMetadata(out _);
             RecentSessions.Clear();
             foreach (var session in sessions.Take(20))
             {
@@ -873,7 +913,7 @@ namespace AIGeekTuner.ViewModels
                     session.Id,
                     session.StartedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
                     FormatDuration((session.CompletedAtUtc ?? session.StartedAtUtc) - session.StartedAtUtc),
-                    session.Samples.Count,
+                    session.SampleCount,
                     // M4.5E.1 补充：已分析/未分析状态（只查文件存在，绝不触发分析）。
                     isAnalyzed: _analysisStore.AnalysisExists(session.Id)));
             }
@@ -929,11 +969,15 @@ namespace AIGeekTuner.ViewModels
             }
 
             var id = SelectedRecent.Id;
-            if (!(ConfirmDelete?.Invoke(id) ?? true))
+            // Destructive actions fail closed until the page attaches its
+            // confirmation service.
+            if (!(ConfirmDelete?.Invoke(id) ?? false))
             {
                 return;
             }
 
+            CancelAnalysis();
+            CancelVoiceOperation();
             _store.Delete(id);
             SelectedRecent = null;
             LoadRecent();
@@ -1088,11 +1132,19 @@ namespace AIGeekTuner.ViewModels
                 return;
             }
 
+            // A new analysis also supersedes an in-flight voice generation for the
+            // same session; page navigation is not the only ownership boundary.
+            var operationVersion = Interlocked.Increment(ref _sessionOperationVersion);
             IsAnalyzing = true;                          // 全局并发守卫（当前只允许一个分析）
             _activeAnalysisSessionId = targetSessionId;  // per-session 显示归属
             OnPropertyChanged(nameof(IsCurrentDetailAnalyzing));
             AnalysisError = string.Empty;
             var contextJson = string.Empty;
+            var cancellation = new CancellationTokenSource();
+            var previousCancellation = Interlocked.Exchange(
+                ref _analysisCancellation, cancellation);
+            previousCancellation?.Cancel();
+            previousCancellation?.Dispose();
             try
             {
                 var summary = session.Summary ?? TelemetrySessionAnalyzer.Analyze(session);
@@ -1108,7 +1160,7 @@ namespace AIGeekTuner.ViewModels
                 contextJson = JsonSerializer.Serialize(evidenceContext);
 
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var run = await _analysisService.AnalyzeAsync(evidenceContext, CancellationToken.None);
+                var run = await _analysisService.AnalyzeAsync(evidenceContext, cancellation.Token);
                 sw.Stop();
 
                 if (!run.Success || run.Result is null)
@@ -1123,8 +1175,34 @@ namespace AIGeekTuner.ViewModels
 
                 contextJson = run.EvidenceContextJson ?? contextJson;
 
+                SessionSafetyOutcome safetyOutcome;
+                try
+                {
+                    safetyOutcome = await _safetyService.ValidateSessionAsync(
+                        run.Result,
+                        cancellation.Token);
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                // Persist and render the post-SafetyGuard result. The raw model
+                // result never reaches analysis.json, the UI collections, or TTS.
+                var safeResult = safetyOutcome.Result;
+
+                // The request may finish after deletion or after the user moved
+                // to another detail. Recheck ownership and disk identity before
+                // allowing analysis.json to be recreated.
+                if (operationVersion != Interlocked.Read(ref _sessionOperationVersion)
+                    || CurrentDetailSessionId != targetSessionId
+                    || _store.Load(targetSessionId) is null)
+                {
+                    return;
+                }
+
                 // Gate D ①：持久化永远属于目标会话（analysis.json for A），与界面无关。
-                var saved = PersistAnalysis(targetSessionId, run.Result, run.ModelName,
+                var saved = PersistAnalysis(targetSessionId, safeResult, run.ModelName,
                     sw.ElapsedMilliseconds, contextJson, run.RepairUsed,
                     run.ProviderId, run.ProviderName);
 
@@ -1140,7 +1218,7 @@ namespace AIGeekTuner.ViewModels
                         AnalysisError = "分析结果已生成，但保存 analysis.json 失败。";
                     }
 
-                    RenderAnalysis(run.Result, run.ModelName, sw.ElapsedMilliseconds,
+                    RenderAnalysis(safeResult, run.ModelName, sw.ElapsedMilliseconds,
                         contextJson, targetSessionId);
                 }
             }
@@ -1159,8 +1237,26 @@ namespace AIGeekTuner.ViewModels
             finally
             {
                 IsAnalyzing = false;
+                if (ReferenceEquals(_analysisCancellation, cancellation))
+                {
+                    _analysisCancellation = null;
+                }
+
+                cancellation.Dispose();
                 _activeAnalysisSessionId = null;
                 OnPropertyChanged(nameof(IsCurrentDetailAnalyzing));
+            }
+        }
+
+        private void CancelAnalysis()
+        {
+            try
+            {
+                _analysisCancellation?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Completion and navigation may race; cancellation is best effort.
             }
         }
 
@@ -1303,19 +1399,28 @@ namespace AIGeekTuner.ViewModels
 
             var text = SpokenSummary;
             var configuration = _voiceSnapshot();
+            var operationVersion = Interlocked.Read(ref _sessionOperationVersion);
             _activeVoiceSessionId = sessionId;
             _voiceFailureText = null;
             VoiceState = VoicePlaybackState.Generating;
+            var cancellation = new CancellationTokenSource();
+            var previousCancellation = Interlocked.Exchange(
+                ref _voiceCancellation, cancellation);
+            previousCancellation?.Cancel();
+            previousCancellation?.Dispose();
             _ = Task.Run(async () =>
             {
                 try
                 {
                     // V2-M4.5D：会话级 voice.wav 缓存命中 → 不再重复调用 GPT-SoVITS
                     //（M4.5E.2 Gate K-14：损坏/空文件按未命中处理，自动重新合成）。
-                    byte[]? wav = _analysisStore.TryLoadVoiceWav(sessionId);
+                     var analysisIdentity = _analysisStore.TryGetAnalysisIdentity(sessionId);
+                     byte[]? wav = analysisIdentity is null
+                         ? null
+                         : _analysisStore.TryLoadVoiceWav(sessionId, analysisIdentity);
                     if (wav is null)
                     {
-                        var result = await _voiceService.SynthesizeAsync(text, configuration, CancellationToken.None);
+                        var result = await _voiceService.SynthesizeAsync(text, configuration, cancellation.Token);
                         if (!result.Succeeded || result.WavBytes is null)
                         {
                             if (CurrentDetailSessionId == sessionId)
@@ -1328,7 +1433,23 @@ namespace AIGeekTuner.ViewModels
                         }
 
                         wav = result.WavBytes;
-                        _analysisStore.SaveVoiceWav(sessionId, wav);
+                        cancellation.Token.ThrowIfCancellationRequested();
+                        if (analysisIdentity is null
+                            || operationVersion != Interlocked.Read(ref _sessionOperationVersion)
+                            || CurrentDetailSessionId != sessionId
+                            || _store.Load(sessionId) is null
+                            || !string.Equals(
+                                _analysisStore.TryGetAnalysisIdentity(sessionId),
+                                analysisIdentity,
+                                StringComparison.Ordinal))
+                        {
+                            return;
+                        }
+
+                        if (!_analysisStore.TrySaveVoiceWav(sessionId, wav, analysisIdentity))
+                        {
+                            return;
+                        }
                     }
 
                     // Gate J：只有用户仍停留在发起会话上才真正出声。
@@ -1343,6 +1464,11 @@ namespace AIGeekTuner.ViewModels
 
                     FinishVoiceOperation(sessionId, failed: false);
                 }
+                catch (OperationCanceledException)
+                {
+                    // Navigation, deletion, or a newer request superseded this
+                    // operation; do not surface it as a synthesis failure.
+                }
                 catch (Exception exception)
                 {
                     Services.Diagnostics.ExceptionLogWriter.Write(exception, "Sessions voice playback");
@@ -1352,6 +1478,15 @@ namespace AIGeekTuner.ViewModels
                     }
 
                     FinishVoiceOperation(sessionId, failed: true, failureText: "语音播放失败");
+                }
+                finally
+                {
+                    if (ReferenceEquals(_voiceCancellation, cancellation))
+                    {
+                        _voiceCancellation = null;
+                    }
+
+                    cancellation.Dispose();
                 }
             });
         }
@@ -1366,13 +1501,20 @@ namespace AIGeekTuner.ViewModels
             if (string.IsNullOrWhiteSpace(SpokenSummary)
                 || VoiceState is VoicePlaybackState.Generating or VoicePlaybackState.Playing
                 || sessionId is null
-                || _analysisStore.HasCachedVoice(sessionId))
+                || (_analysisStore.TryGetAnalysisIdentity(sessionId) is { } existingIdentity
+                    && _analysisStore.HasCachedVoice(sessionId, existingIdentity)))
             {
                 return;
             }
 
             var text = SpokenSummary;
             var configuration = _voiceSnapshot();
+            var operationVersion = Interlocked.Read(ref _sessionOperationVersion);
+            var analysisIdentity = _analysisStore.TryGetAnalysisIdentity(sessionId);
+            if (analysisIdentity is null)
+            {
+                return;
+            }
             if (string.IsNullOrWhiteSpace(configuration.Endpoint))
             {
                 return;
@@ -1380,11 +1522,16 @@ namespace AIGeekTuner.ViewModels
 
             _activeVoiceSessionId = sessionId;
             VoiceState = VoicePlaybackState.Generating;
+            var cancellation = new CancellationTokenSource();
+            var previousCancellation = Interlocked.Exchange(
+                ref _voiceCancellation, cancellation);
+            previousCancellation?.Cancel();
+            previousCancellation?.Dispose();
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    var result = await _voiceService.SynthesizeAsync(text, configuration, CancellationToken.None);
+                    var result = await _voiceService.SynthesizeAsync(text, configuration, cancellation.Token);
                     if (!result.Succeeded || result.WavBytes is null)
                     {
                         FinishVoiceOperation(
@@ -1394,8 +1541,27 @@ namespace AIGeekTuner.ViewModels
 
                     // Gate G：缓存先落盘（磁盘是事实源），再结束操作状态——
                     // 完成后 VoiceStateText 按缓存事实自动显示“已生成”。
-                    _analysisStore.SaveVoiceWav(sessionId, result.WavBytes);
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    if (operationVersion != Interlocked.Read(ref _sessionOperationVersion)
+                        || CurrentDetailSessionId != sessionId
+                        || _store.Load(sessionId) is null
+                        || !string.Equals(
+                            _analysisStore.TryGetAnalysisIdentity(sessionId),
+                            analysisIdentity,
+                            StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+
+                    if (!_analysisStore.TrySaveVoiceWav(sessionId, result.WavBytes, analysisIdentity))
+                    {
+                        return;
+                    }
                     FinishVoiceOperation(sessionId, failed: false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Navigation, deletion, or a newer request superseded this operation.
                 }
                 catch (Exception exception)
                 {
@@ -1403,7 +1569,28 @@ namespace AIGeekTuner.ViewModels
                     FinishVoiceOperation(
                         sessionId, failed: true, failureText: "语音预生成失败，播放时会重试");
                 }
+                finally
+                {
+                    if (ReferenceEquals(_voiceCancellation, cancellation))
+                    {
+                        _voiceCancellation = null;
+                    }
+
+                    cancellation.Dispose();
+                }
             });
+        }
+
+        private void CancelVoiceOperation()
+        {
+            try
+            {
+                _voiceCancellation?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Completion and navigation may race; cancellation is best effort.
+            }
         }
 
         /// <summary>
@@ -1497,31 +1684,7 @@ namespace AIGeekTuner.ViewModels
         }
 
         internal static string LabelOf(TelemetryReading reading)
-        {
-            var device = reading.Device.Kind switch
-            {
-                TelemetryDeviceKind.Cpu => "CPU",
-                TelemetryDeviceKind.Gpu => reading.Device.DisplayName.Length > 0
-                    ? "GPU · " + reading.Device.DisplayName
-                    : "GPU",
-                TelemetryDeviceKind.Memory => "内存",
-                TelemetryDeviceKind.Storage => "磁盘 · " + reading.Device.DisplayName,
-                _ => reading.Device.DisplayName,
-            };
-            var metric = reading.MetricKey.Value switch
-            {
-                "cpu.package.temperature" or "gpu.core.temperature" or "storage.temperature" => "温度",
-                "gpu.hotspot.temperature" => "热点温度",
-                "gpu.memory.temperature" => "显存温度",
-                "cpu.total.utilization" or "gpu.core.utilization" or "memory.utilization" => "使用率",
-                "cpu.clock" or "gpu.core.clock" or "memory.clock" => "频率",
-                "cpu.package.power" or "gpu.board.power" => "功耗",
-                "cpu.throttling" => "降频占比",
-                "memory.used" or "gpu.memory.used" => "已用容量",
-                _ => reading.MetricKey.Value,
-            };
-            return device + " " + metric;
-        }
+            => TelemetryLiveMetricLabel.For(reading);
 
         private static TelemetryUnit ParseUnit(string unit) => unit switch
         {

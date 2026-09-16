@@ -134,6 +134,10 @@ namespace AIGeekTuner.Tests.Services.Telemetry.Aida64
                 canonical.Single(r => r.MetricKey == TelemetryMetricKey.MemoryUsed).Value);
             Assert.Equal(2048 * 1048576d,
                 canonical.Single(r => r.MetricKey == TelemetryMetricKey.GpuMemoryUsed).Value);
+
+            Assert.True(Aida64CanonicalMapper.TryClassifyDeviceAndUnit(
+                "SGPU1USEDDEMEM", out _, out var dedicatedUnit));
+            Assert.Equal(TelemetryUnit.Megabyte, dedicatedUnit);
         }
 
         [Fact]

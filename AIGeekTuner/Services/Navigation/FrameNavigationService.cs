@@ -9,6 +9,7 @@ namespace AIGeekTuner.Services.Navigation
         private readonly Frame _frame;
         private readonly Func<AppPage, object?, Page> _pageFactory;
         private AppPage? _currentPage;
+        private int _newNavigationCount;
 
         public FrameNavigationService(
             Frame frame,
@@ -51,6 +52,17 @@ namespace AIGeekTuner.Services.Navigation
 
         private void OnFrameNavigated(object sender, NavigationEventArgs e)
         {
+            // Sidebar navigation creates a fresh Page instance by design. Keep
+            // at most the immediately preceding page so repeated navigation
+            // cannot retain an unbounded WPF journal of stale DataContexts.
+            _newNavigationCount++;
+
+            while (_newNavigationCount > 2 && _frame.CanGoBack)
+            {
+                _frame.RemoveBackEntry();
+                _newNavigationCount--;
+            }
+
             if (e.Content is Page { Tag: AppPage page })
             {
                 _currentPage = page;

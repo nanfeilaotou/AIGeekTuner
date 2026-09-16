@@ -188,10 +188,20 @@ namespace AIGeekTuner.Tests.Services.Incidents
         }
 
         [Fact]
-        public void Load_MissingIncidentsJson_ReturnsNull()
+    public void Load_MissingIncidentsJson_ReturnsNull()
         {
             // 旧 Session 没有 incidents.json 是合法状态（不 backfill，不报错）。
             Assert.Null(_store.Load("no-such-session"));
+        }
+
+        [Fact]
+        public void MaliciousId_DoesNotAccessOutsideRoot()
+        {
+            foreach (var id in new[] { "../escape", "..\\escape", "C:\\outside", "/tmp/outside" })
+            {
+                Assert.Null(_store.Load(id));
+                Assert.Throws<ArgumentException>(() => _store.PathOf(id));
+            }
         }
 
         [Fact]

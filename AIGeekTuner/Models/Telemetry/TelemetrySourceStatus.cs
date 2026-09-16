@@ -16,6 +16,12 @@ namespace AIGeekTuner.Models.Telemetry
         Degraded = 3,
 
         /// <summary>读取失败；技术细节只进日志。</summary>
-        Error = 4
+        Error = 4,
+
+        /// <summary>调用方等待期限已到；底层读取可能仍在结束过程中。</summary>
+        Timeout = 5,
+
+        /// <summary>同一来源已有真实读取在进行，本轮未启动第二个读取。</summary>
+        Busy = 6
     }
 }

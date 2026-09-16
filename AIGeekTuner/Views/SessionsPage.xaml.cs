@@ -28,6 +28,7 @@ namespace AIGeekTuner.Views
             Loaded += (_, _) =>
             {
                 _uiTimer.Start();
+                AttachConfirmation(DataContext as SessionsViewModel);
                 // V2-M4.5E Gate H：每次回到 Sessions 页应用入口规则
                 //（录制中 → Record 视图；未录制 → 保留最近模式）。ViewModel 单例，
                 // 页面实例可被重建，入口规则必须挂在页面上而不是构造器里。
@@ -36,17 +37,31 @@ namespace AIGeekTuner.Views
                     enteredViewModel.OnPageEntered();
                 }
             };
-            Unloaded += (_, _) => _uiTimer.Stop();
-
-            if (DataContext is SessionsViewModel vm)
+            Unloaded += (_, _) =>
             {
-                vm.ConfirmDelete = id => MessageBox.Show(
-                    Window.GetWindow(this),
-                    "确定删除该录制会话？此操作不可恢复。",
-                    "AI-GeekTuner",
-                    MessageBoxButton.OKCancel,
-                    MessageBoxImage.Warning) == MessageBoxResult.OK;
+                _uiTimer.Stop();
+                if (DataContext is SessionsViewModel viewModel)
+                {
+                    viewModel.OnPageExited();
+                }
+            };
+            DataContextChanged += (_, args) =>
+                AttachConfirmation(args.NewValue as SessionsViewModel);
+        }
+
+        private void AttachConfirmation(SessionsViewModel? viewModel)
+        {
+            if (viewModel is null)
+            {
+                return;
             }
+
+            viewModel.ConfirmDelete = id => MessageBox.Show(
+                Window.GetWindow(this),
+                "确定删除该录制会话？此操作不可恢复。",
+                "AI-GeekTuner",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning) == MessageBoxResult.OK;
         }
     }
 }

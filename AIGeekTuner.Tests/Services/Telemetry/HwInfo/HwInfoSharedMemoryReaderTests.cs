@@ -39,6 +39,10 @@ namespace AIGeekTuner.Tests.Services.Telemetry.HwInfo
 
             Assert.True(outcome.Available);
             Assert.Equal(2, outcome.Sensors.Count);
+            Assert.Equal((uint)1, outcome.Sensors[0].SensorId);
+            Assert.Equal((uint)0, outcome.Sensors[0].SensorInstance);
+            Assert.Equal((uint)2, outcome.Sensors[1].SensorId);
+            Assert.Equal((uint)0, outcome.Sensors[1].SensorInstance);
             Assert.Equal(3, outcome.Readings.Count);
             var cpuTemp = outcome.Readings.First(r => r.ReadingId == 10);
             Assert.Equal(71.4, cpuTemp.Value);

@@ -24,5 +24,8 @@ namespace AIGeekTuner.Models.Incidents
         TimeSpan PostBuffer,
         IncidentQueryStatus QueryStatus,
         IReadOnlyList<IncidentChannelResult> Channels,
-        IReadOnlyList<WindowsIncident> Incidents);
+        IReadOnlyList<WindowsIncident> Incidents)
+    {
+        public bool MayBeTruncated { get; init; }
+    }
 }

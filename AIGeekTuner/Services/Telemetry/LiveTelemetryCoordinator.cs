@@ -28,6 +28,8 @@ namespace AIGeekTuner.Services.Telemetry
         void Start(int intervalMs);
 
         void Stop();
+
+        Task StopAsync();
     }
 
     /// <summary>
@@ -37,7 +39,7 @@ namespace AIGeekTuner.Services.Telemetry
     /// 模式切换是自愈的：轮询循环每拍检查 IsRecording，
     /// 录制开始自动跳过 Hub 读取，录制结束自动恢复。
     /// </summary>
-    public sealed class LiveTelemetryCoordinator : ILiveTelemetrySource
+    public sealed class LiveTelemetryCoordinator : ILiveTelemetrySource, IDisposable, IAsyncDisposable
     {
         private readonly object _gate = new();
         private readonly ITelemetryHub _hub;
@@ -46,6 +48,12 @@ namespace AIGeekTuner.Services.Telemetry
         private CancellationTokenSource? _cts;
         private Task? _loop;
         private int _firstSnapshotLogged;
+        private long _generation;
+        private int _disposed;
+        private bool _isRunning;
+        private LiveTelemetrySourceMode _mode;
+        private int _intervalMs;
+        private TelemetrySnapshot? _latestSnapshot;
 
         public LiveTelemetryCoordinator(ITelemetryHub hub, ITelemetryRecordingService? recorder = null)
         {
@@ -60,150 +68,291 @@ namespace AIGeekTuner.Services.Telemetry
             }
         }
 
-        public bool IsRunning { get; private set; }
+        public bool IsRunning
+        {
+            get { lock (_gate) return _isRunning; }
+        }
 
-        public LiveTelemetrySourceMode Mode { get; private set; }
+        public LiveTelemetrySourceMode Mode
+        {
+            get { lock (_gate) return _mode; }
+        }
 
-        public int IntervalMs { get; private set; }
+        public int IntervalMs
+        {
+            get { lock (_gate) return _intervalMs; }
+        }
 
-        public TelemetrySnapshot? LatestSnapshot { get; private set; }
+        public TelemetrySnapshot? LatestSnapshot
+        {
+            get { lock (_gate) return _latestSnapshot; }
+        }
 
         public event Action<TelemetrySnapshot>? SnapshotUpdated;
 
         public void Start(int intervalMs)
         {
+            ThrowIfDisposed();
+            // Start/Restart has an explicit hand-off: the old loop has observed
+            // cancellation and exited before a new generation is installed.
+            Stop();
+
+            long generation;
+            bool mirrorRecorder;
             lock (_gate)
             {
-                StopLocked();
-                IntervalMs = Math.Max(200, intervalMs);
+                ThrowIfDisposed();
+                _intervalMs = Math.Max(200, intervalMs);
                 // 录制中启动时不额外轮询 Hub；循环内每拍检测并跳过读取。
-                Mode = IsRecording
+                _mode = IsRecording
                     ? LiveTelemetrySourceMode.Recorder
                     : LiveTelemetrySourceMode.Coordinator;
-                IsRunning = true;
-                if (Mode == LiveTelemetrySourceMode.Recorder)
-                {
-                    MirrorRecorderLatest();
-                }
+                _isRunning = true;
+                mirrorRecorder = _mode == LiveTelemetrySourceMode.Recorder;
 
                 _cts = new CancellationTokenSource();
                 var ct = _cts.Token;
-                var capturedInterval = IntervalMs;
+                var capturedInterval = _intervalMs;
+                generation = ++_generation;
+                _loop = Task.Run(
+                    () => RunLoopAsync(generation, capturedInterval, ct),
+                    CancellationToken.None);
+            }
 
-                _loop = Task.Run(async () =>
-                {
-                    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(capturedInterval));
-                    while (!ct.IsCancellationRequested)
-                    {
-                        try
-                        {
-                            if (IsRecording)
-                            {
-                                // §22 镜像模式：Recorder 已经在采样，绝不双读 Hub。
-                                Mode = LiveTelemetrySourceMode.Recorder;
-                            }
-                            else
-                            {
-                                Mode = LiveTelemetrySourceMode.Coordinator;
-                                var snapshot = await _hub.ReadAsync(ct).ConfigureAwait(false);
-                                Publish(snapshot);
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            break;
-                        }
-                        catch (Exception exception)
-                        {
-                            ExceptionLogWriter.Write(exception, "LiveTelemetry capture");
-                        }
-
-                        try
-                        {
-                            if (!await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
-                            {
-                                break;
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            break;
-                        }
-                    }
-                }, CancellationToken.None);
+            if (mirrorRecorder)
+            {
+                MirrorRecorderLatest(generation);
             }
         }
 
         public void Stop()
         {
+            StopAsync().GetAwaiter().GetResult();
+        }
+
+        public async Task StopAsync()
+        {
+            CancellationTokenSource? cancellation;
+            Task? loop;
             lock (_gate)
             {
-                StopLocked();
+                _isRunning = false;
+                _generation++;
+                cancellation = _cts;
+                loop = _loop;
+                _cts = null;
+                _loop = null;
+            }
+
+            if (cancellation is null)
+            {
+                return;
+            }
+
+            try
+            {
+                cancellation.Cancel();
+                if (loop is not null)
+                {
+                    try
+                    {
+                        await loop.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Expected stop path.
+                    }
+                }
+            }
+            finally
+            {
+                cancellation.Dispose();
             }
         }
 
         private bool IsRecording => _recorder is { IsRecording: true };
 
-        private void MirrorRecorderLatest()
+        private async Task RunLoopAsync(
+            long generation,
+            int capturedInterval,
+            CancellationToken cancellationToken)
         {
-            var session = _recorder?.CurrentSession;
-            if (session is null || session.Samples.Count == 0)
+            using var timer = new PeriodicTimer(
+                TimeSpan.FromMilliseconds(capturedInterval));
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var mode = ModeForNextCapture(generation, cancellationToken);
+                    if (mode is null)
+                    {
+                        break;
+                    }
+
+                    if (mode == LiveTelemetrySourceMode.Coordinator)
+                    {
+                        var snapshot = await _hub
+                            .ReadAsync(cancellationToken)
+                            .ConfigureAwait(false);
+                        TryPublish(snapshot, generation, LiveTelemetrySourceMode.Coordinator);
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    ExceptionLogWriter.Write(exception, "LiveTelemetry capture");
+                }
+
+                try
+                {
+                    if (!await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        break;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private LiveTelemetrySourceMode? ModeForNextCapture(
+            long generation,
+            CancellationToken cancellationToken)
+        {
+            lock (_gate)
+            {
+                if (!_isRunning
+                    || generation != _generation
+                    || cancellationToken.IsCancellationRequested)
+                {
+                    return null;
+                }
+
+                _mode = IsRecording
+                    ? LiveTelemetrySourceMode.Recorder
+                    : LiveTelemetrySourceMode.Coordinator;
+                return _mode;
+            }
+        }
+
+        private void MirrorRecorderLatest(long generation)
+        {
+            var recording = _recorder?.LiveSnapshot;
+            if (recording is null || recording.LatestCapturedAtUtc is null)
             {
                 return;
             }
 
-            var last = session.Samples[^1];
-            var sources = session.InitialSources.Count > 0
-                ? session.InitialSources
-                : System.Array.Empty<TelemetrySourceReport>();
-            Publish(new TelemetrySnapshot(
-                last.CapturedAtUtc,
-                last.Readings,
-                sources,
-                System.Array.Empty<RawTelemetryReading>()));
+            TryPublish(new TelemetrySnapshot(
+                recording.LatestCapturedAtUtc.Value,
+                recording.LatestReadings,
+                recording.Sources,
+                System.Array.Empty<RawTelemetryReading>()),
+                generation,
+                LiveTelemetrySourceMode.Recorder);
         }
 
-        private void Publish(TelemetrySnapshot snapshot)
+        private bool TryPublish(
+            TelemetrySnapshot snapshot,
+            long generation,
+            LiveTelemetrySourceMode sourceMode)
         {
-            LatestSnapshot = snapshot;
+            Action<TelemetrySnapshot>? subscribers;
+            lock (_gate)
+            {
+                if (!_isRunning || generation != _generation || _cts?.IsCancellationRequested != false)
+                {
+                    return false;
+                }
+
+                var recording = IsRecording;
+                if ((sourceMode == LiveTelemetrySourceMode.Coordinator && recording)
+                    || (sourceMode == LiveTelemetrySourceMode.Recorder && !recording))
+                {
+                    return false;
+                }
+
+                _mode = sourceMode;
+                _latestSnapshot = snapshot;
+                subscribers = SnapshotUpdated;
+            }
+
             if (Interlocked.Exchange(ref _firstSnapshotLogged, 1) == 0)
             {
                 StartupBreadcrumbLogger.Write("FIRST_TELEMETRY_READY");
             }
-            SnapshotUpdated?.Invoke(snapshot);
+            subscribers?.Invoke(snapshot);
+            return true;
         }
 
         private void OnRecorderSample(TelemetrySample sample)
         {
+            long generation;
             lock (_gate)
             {
                 // 只有已启动（无论 Coordinator 还是 Recorder 模式）才镜像推送；
                 // 未启动时静默丢弃，避免录制数据绕过硬件页的显示开关。
-                if (!IsRunning)
+                if (!_isRunning || !IsRecording)
                 {
                     return;
                 }
 
-                Mode = LiveTelemetrySourceMode.Recorder;
-                IntervalMs = _recorder?.CurrentSession?.RequestedIntervalMs ?? IntervalMs;
+                _mode = LiveTelemetrySourceMode.Recorder;
+                _intervalMs = _recorder?.LiveSnapshot?.RequestedIntervalMs ?? _intervalMs;
+                generation = _generation;
             }
 
-            var sourceList = _recorder?.CurrentSession?.InitialSources
-                ?? (IReadOnlyList<TelemetrySourceReport>)Array.Empty<TelemetrySourceReport>();
-            Publish(new TelemetrySnapshot(
+            var liveSources = _recorder?.LiveSnapshot?.Sources;
+            var sourceList = liveSources.HasValue
+                ? liveSources.Value
+                : System.Collections.Immutable.ImmutableArray<TelemetrySourceReport>.Empty;
+            TryPublish(new TelemetrySnapshot(
                 sample.CapturedAtUtc,
                 sample.Readings,
                 sourceList,
-                Array.Empty<RawTelemetryReading>()));
+                Array.Empty<RawTelemetryReading>()),
+                generation,
+                LiveTelemetrySourceMode.Recorder);
         }
 
-        private void StopLocked()
+        public void Dispose()
         {
-            IsRunning = false;
-            _cts?.Cancel();
-            _cts?.Dispose();
-            _cts = null;
-            _loop = null;
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            Stop();
+            if (_recorder is not null)
+            {
+                _recorder.SampleCaptured -= OnRecorderSample;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await StopAsync().ConfigureAwait(false);
+            if (_recorder is not null)
+            {
+                _recorder.SampleCaptured -= OnRecorderSample;
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            ObjectDisposedException.ThrowIf(
+                Volatile.Read(ref _disposed) != 0,
+                this);
         }
     }
 }

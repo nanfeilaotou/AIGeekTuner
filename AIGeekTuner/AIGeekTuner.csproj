@@ -36,6 +36,12 @@
     <None Update="KnowledgeBase\*.json"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\README.md"
+          Link="README.md"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\docs\RELEASE.md"
+          Link="RELEASE.md"
+          CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

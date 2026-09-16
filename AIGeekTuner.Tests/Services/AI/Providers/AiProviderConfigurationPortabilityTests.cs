@@ -2,6 +2,8 @@ using System.IO;
 using System.Text.Json;
 using AIGeekTuner.Services.AI.Providers;
 using AIGeekTuner.Services.AI.Providers.Configuration;
+using AIGeekTuner.Services.AI.Providers.Credentials;
+using AIGeekTuner.Services.AI.Providers.Runtime;
 using AIGeekTuner.Configuration;
 using AIGeekTuner.Tests.TestSupport;
 
@@ -166,6 +168,47 @@ public sealed class AiProviderConfigurationPortabilityTests : IDisposable
         Assert.Contains("new-provider", result.MissingCredentialProviderIds);
         Assert.Equal("local-secret", credentials.Secrets["cloud"]);
         Assert.Contains("local-secret", credentials.Secrets.Values);
+    }
+
+    [Fact]
+    public async Task Import_SameProviderIdCrossOrigin_DoesNotReuseLocalCredentialAtRuntime()
+    {
+        var credentials = new WindowsDpapiCredentialStore(_temp.Combine("credentials.json"));
+        await credentials.SaveAsync("cloud", "sk-local");
+        var store = new ScriptedProviderStore(new AiProviderConfiguration
+        {
+            ActiveProviderId = "cloud",
+            Profiles = [Cloud("cloud")]
+        });
+        var service = new AiProviderConfigurationPortabilityService(
+            store, credentials, _temp.Combine("ai-providers.json"));
+        var path = _temp.Combine("cross-origin-import.json");
+        await File.WriteAllTextAsync(path, """
+        {
+          "schemaVersion": 1,
+          "credentialsIncluded": false,
+          "activeProviderId": "cloud",
+          "profiles": [{
+            "id": "cloud",
+            "displayName": "导入后的 Provider",
+            "kind": "openAiCompatible",
+            "baseUrl": "https://new.example.invalid/v2",
+            "models": [{ "id": "cloud-model" }],
+            "defaultModelId": "cloud-model",
+            "structuredOutputMode": "openAiJsonSchema",
+            "enabled": true
+          }]
+        }
+        """);
+
+        var import = await service.ImportAsync(path);
+
+        var snapshot = await new AiRuntimeSnapshotSource(store, credentials)
+            .TryCaptureAsync(30);
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.ApiKey);
+        Assert.Contains("cloud", import.MissingCredentialProviderIds);
+        Assert.Equal("sk-local", await credentials.LoadAsync("cloud"));
     }
 
     [Fact]

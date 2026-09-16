@@ -85,6 +85,16 @@ namespace AIGeekTuner.Tests.Services.Telemetry
         }
 
         [Fact]
+        public void IntelArc_IsDiscrete_NotIntelIntegrated()
+        {
+            Assert.Equal(
+                HardwareLiveViewBuilder.GpuIntegrationKind.Discrete,
+                HardwareLiveViewBuilder.ClassifyGpu("Intel Arc A770"));
+            Assert.False(HardwareLiveViewBuilder.IsIntelIntegratedGpu("Intel Arc A770"));
+            Assert.True(HardwareLiveViewBuilder.IsIntelIntegratedGpu("Intel Iris Xe Graphics"));
+        }
+
+        [Fact]
         public void AnonymousGpu_WhenNoResolvedName_IsHidden()
         {
             var snapshot = new TelemetrySnapshot(Now,

@@ -51,9 +51,10 @@ namespace AIGeekTuner.Services.Telemetry.Recording
                 DetectSignificantChanges(items, totalSamples, detected);
             }
 
-            if (series.TryGetValue(
-                    SeriesKey(TelemetryDeviceIdentity.Cpu("cpu"), TelemetryMetricKey.CpuThrottling),
-                    out var throttleItems))
+            var throttleItems = series.Values.FirstOrDefault(items =>
+                items.Device.Kind == TelemetryDeviceKind.Cpu
+                && items.MetricKey == TelemetryMetricKey.CpuThrottling);
+            if (throttleItems is not null)
             {
                 DetectThrottle(throttleItems, totalSamples, detected);
             }
@@ -74,7 +75,9 @@ namespace AIGeekTuner.Services.Telemetry.Recording
                 Statistics: statistics,
                 TopEvents: topEvents,
                 EventWindows: windows,
-                FinalSources: session.InitialSources);
+                FinalSources: session.LatestSources.Count > 0
+                    ? session.LatestSources
+                    : session.InitialSources);
         }
 
         private static string SeriesKey(TelemetryDeviceIdentity device, TelemetryMetricKey metric) =>

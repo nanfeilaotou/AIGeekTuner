@@ -37,7 +37,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry
         }
 
         [Fact]
-        public void CaseA_SingleGpu_ReportedByAllProviders_MergesDespiteNameStyle()
+        public void CaseA_AnonymousSingleton_DoesNotAttachWithoutIdentityEvidence()
         {
             var devices = new[]
             {
@@ -49,8 +49,11 @@ namespace AIGeekTuner.Tests.Services.Telemetry
             var groups = TelemetryDeviceReconciler.Reconcile(devices);
 
             var gpuGroups = groups.Where(group => group.Kind == TelemetryDeviceKind.Gpu).ToArray();
-            var single = Assert.Single(gpuGroups);
-            Assert.Equal(3, single.Members.Count);
+            Assert.Equal(2, gpuGroups.Length);
+            Assert.Contains(gpuGroups, group => group.Members.Count == 2);
+            Assert.Contains(gpuGroups, group =>
+                group.Members.Count == 1
+                && group.Members[0].Source == TelemetrySourceKind.Aida64);
         }
 
         [Fact]
@@ -146,7 +149,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry
         }
 
         [Fact]
-        public void SingleDisk_AidaIndexAndLhmDrive_SingletonMerge()
+        public void SingleDisk_AidaIndexAndLhmDrive_DoesNotMergeWithoutEvidence()
         {
             var devices = new[]
             {
@@ -156,8 +159,7 @@ namespace AIGeekTuner.Tests.Services.Telemetry
 
             var groups = TelemetryDeviceReconciler.Reconcile(devices);
 
-            var single = Assert.Single(groups, group => group.Kind == TelemetryDeviceKind.Storage);
-            Assert.Equal(2, single.Members.Count);
+            Assert.Equal(2, groups.Count(group => group.Kind == TelemetryDeviceKind.Storage));
         }
 
         [Fact]
@@ -174,6 +176,50 @@ namespace AIGeekTuner.Tests.Services.Telemetry
             var groups = TelemetryDeviceReconciler.Reconcile(devices);
 
             Assert.Equal(4, groups.Count(group => group.Kind == TelemetryDeviceKind.Storage));
+        }
+
+        [Fact]
+        public void SameModelDisks_InReversedProviderOrder_RemainDistinct()
+        {
+            var devices = new[]
+            {
+                Disk(TelemetrySourceKind.HwInfo, "sensor:disk-a", "Same NVMe", 0),
+                Disk(TelemetrySourceKind.HwInfo, "sensor:disk-b", "Same NVMe", 1),
+                Disk(TelemetrySourceKind.LibreHardwareMonitor, "lhm:/nvme/1", "Same NVMe", 0),
+                Disk(TelemetrySourceKind.LibreHardwareMonitor, "lhm:/nvme/0", "Same NVMe", 1),
+            };
+
+            var groups = TelemetryDeviceReconciler.Reconcile(devices);
+
+            Assert.Equal(4, groups.Count(group => group.Kind == TelemetryDeviceKind.Storage));
+            Assert.All(groups.Where(group => group.Kind == TelemetryDeviceKind.Storage),
+                group => Assert.Single(group.Members));
+        }
+
+        [Fact]
+        public void SingleDimmCandidates_WithoutLocatorEvidence_DoNotMerge()
+        {
+            var devices = new[]
+            {
+                new SourceDeviceInfo(
+                    TelemetrySourceKind.Aida64,
+                    TelemetryDeviceKind.MemoryModule,
+                    "memory-module:0",
+                    "DIMM #0",
+                    0,
+                    []),
+                new SourceDeviceInfo(
+                    TelemetrySourceKind.HwInfo,
+                    TelemetryDeviceKind.MemoryModule,
+                    "sensor:100:0",
+                    "RAM Module #0",
+                    0,
+                    []),
+            };
+
+            var groups = TelemetryDeviceReconciler.Reconcile(devices);
+
+            Assert.Equal(2, groups.Count(group => group.Kind == TelemetryDeviceKind.MemoryModule));
         }
 
         [Fact]

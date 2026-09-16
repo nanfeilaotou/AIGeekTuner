@@ -30,9 +30,10 @@ public sealed class ScriptedProviderStore : IAiProviderProfileStore
 }
 
 /// <summary>内存版 IAiCredentialStore：明文只在字典里，供断言“读取次数 / 是否读取”。</summary>
-public sealed class FakeAiCredentialStore : IAiCredentialStore
+public sealed class FakeAiCredentialStore : IAiCredentialStore, IAiCredentialOriginStore
 {
     public Dictionary<string, string> Secrets { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string?> Origins { get; } = new(StringComparer.Ordinal);
 
     public List<string> LoadCalls { get; } = [];
 
@@ -41,6 +42,18 @@ public sealed class FakeAiCredentialStore : IAiCredentialStore
     public Task SaveAsync(string providerId, string plainTextSecret, CancellationToken cancellationToken = default)
     {
         Secrets[providerId] = plainTextSecret;
+        Origins[providerId] = null;
+        return Task.CompletedTask;
+    }
+
+    public Task SaveAsync(
+        string providerId,
+        string plainTextSecret,
+        string? origin,
+        CancellationToken cancellationToken = default)
+    {
+        Secrets[providerId] = plainTextSecret;
+        Origins[providerId] = origin;
         return Task.CompletedTask;
     }
 
@@ -53,6 +66,12 @@ public sealed class FakeAiCredentialStore : IAiCredentialStore
     public Task DeleteAsync(string providerId, CancellationToken cancellationToken = default)
     {
         Secrets.Remove(providerId);
+        Origins.Remove(providerId);
         return Task.CompletedTask;
     }
+
+    public Task<string?> LoadOriginAsync(
+        string providerId,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(Origins.TryGetValue(providerId, out var origin) ? origin : null);
 }

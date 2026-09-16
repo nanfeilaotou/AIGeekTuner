@@ -20,7 +20,7 @@ credentials.json
 settings.local.json
 logs/
 crash/
-/publish/
+**/publish/
 /docs/AI_HANDOFF.md
 /AIGeekTuner_Settings_v*.json
 /AIGeekTuner_AIProviders_v*.json

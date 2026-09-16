@@ -1,6 +1,7 @@
 using AIGeekTuner.Models.Sessions;
 using AIGeekTuner.Models.Telemetry;
 using AIGeekTuner.Services.Diagnostics;
+using System.Collections.Immutable;
 
 namespace AIGeekTuner.Services.Telemetry.Recording
 {
@@ -8,8 +9,13 @@ namespace AIGeekTuner.Services.Telemetry.Recording
     {
         bool IsRecording { get; }
 
-        /// <summary>活动会话的实时引用（UI 以只读方式轮询，不做并发采样）。</summary>
+        /// <summary>
+        /// 活动会话的实时引用，仅供持久化/分析边界使用；UI 不得枚举其中的 Samples。
+        /// </summary>
         TelemetryRecordingSession? CurrentSession { get; }
+
+        /// <summary>只含展示指标的不可变增量快照；UI 刷新成本与指标数相关。</summary>
+        TelemetryRecordingSnapshot? LiveSnapshot => null;
 
         TelemetrySample? LatestSample { get; }
 
@@ -53,13 +59,15 @@ namespace AIGeekTuner.Services.Telemetry.Recording
         private TelemetryRecordingSession? _session;
         private CancellationTokenSource? _loopCts;
         private Task? _loopTask;
-        private bool _stopRequested;
 
         // 事件检测状态（跨采样）
         private readonly Dictionary<TelemetrySourceKind, TelemetrySourceStatus> _lastSourceStatus = new();
         private readonly Dictionary<(TelemetryDeviceKind, string, string), TelemetrySourceKind> _lastMetricSource = new();
         private DateTimeOffset? _lastSuccessfulCaptureAtUtc;
         private int _sequence;
+        private TelemetrySample? _latestSample;
+        private readonly Dictionary<string, LiveMetricAccumulator> _liveMetrics = new(StringComparer.Ordinal);
+        private TelemetryRecordingSnapshot? _liveSnapshot;
 
         public TelemetryRecordingService(
             ITelemetryHub hub,
@@ -103,7 +111,18 @@ namespace AIGeekTuner.Services.Telemetry.Recording
             {
                 lock (_gate)
                 {
-                    return _session?.Samples.Count > 0 ? _session.Samples[^1] : null;
+                    return _latestSample;
+                }
+            }
+        }
+
+        public TelemetryRecordingSnapshot? LiveSnapshot
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _liveSnapshot;
                 }
             }
         }
@@ -119,7 +138,7 @@ namespace AIGeekTuner.Services.Telemetry.Recording
 
             lock (_gate)
             {
-                if (IsRecording)
+                if (IsRecording || _loopTask is { IsCompleted: false })
                 {
                     return false; // 单活动会话（§35）
                 }
@@ -128,56 +147,100 @@ namespace AIGeekTuner.Services.Telemetry.Recording
                 _lastSourceStatus.Clear();
                 _lastMetricSource.Clear();
                 _lastSuccessfulCaptureAtUtc = null;
-                _stopRequested = false;
+                _latestSample = null;
+                _liveMetrics.Clear();
                 LastError = null;
-                _session = TelemetryRecordingSession.Start(intervalMs, DateTimeOffset.UtcNow);
-                _loopCts = new CancellationTokenSource();
-                var ct = _loopCts.Token;
+                var session = TelemetryRecordingSession.Start(intervalMs, DateTimeOffset.UtcNow);
+                var loopCts = new CancellationTokenSource();
+                _session = session;
+                _loopCts = loopCts;
+                _liveSnapshot = TelemetryRecordingSnapshot.Empty(
+                    session.Id,
+                    session.StartedAtUtc,
+                    session.RequestedIntervalMs);
+                var ct = loopCts.Token;
                 var capturedInterval = intervalMs; // 间隔快照：录制期间不受设置变化影响（§39）
 
                 _loopTask = Task.Run(async () =>
                 {
-                    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(capturedInterval));
-                    while (!ct.IsCancellationRequested && !_stopRequested)
+                    try
                     {
-                        try
+                        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(capturedInterval));
+                        while (!ct.IsCancellationRequested)
                         {
-                            var sample = await CaptureOnceAsync(_session!, ct);
-                            _session!.AddSample(sample);
-                            SampleCaptured?.Invoke(sample);
-                            if (_session!.Samples.Count >= _maxSamples)
+                            try
                             {
-                                // 上限保护：自动正常收尾（§14），包括分析与落盘。
-                                var finalized = FinalizeCoreLocked(RecordingStatus.Completed);
-                                SaveIfPossible(finalized);
+                                var sample = await CaptureOnceAsync(session, ct);
+                                var reachedLimit = false;
+                                lock (_gate)
+                                {
+                                    if (!ReferenceEquals(_session, session)
+                                        || session.Status != RecordingStatus.Recording)
+                                    {
+                                        break;
+                                    }
+
+                                    session.AddSample(sample);
+                                    _latestSample = sample;
+                                    UpdateLiveSnapshotLocked(session, sample);
+                                    reachedLimit = session.Samples.Count >= _maxSamples;
+                                }
+
+                                SampleCaptured?.Invoke(sample);
+                                if (reachedLimit)
+                                {
+                                    TelemetryRecordingSession? finalized;
+                                    lock (_gate)
+                                    {
+                                        // 上限保护：自动正常收尾（§14），包括分析与落盘。
+                                        finalized = ReferenceEquals(_session, session)
+                                            ? FinalizeCoreLocked(RecordingStatus.Completed)
+                                            : null;
+                                    }
+
+                                    SaveIfPossible(finalized);
+                                    break;
+                                }
+                            }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                            {
+                                break;
+                            }
+                            catch (Exception exception)
+                            {
+                                // 单轮失败不终止会话：记 SampleGap 继续下一轮（§37）。
+                                ExceptionLogWriter.Write(exception, "Telemetry/recorder capture");
+                                session.AddEvent(TelemetrySessionEvent.Simple(
+                                    TelemetrySessionEventType.SampleGap,
+                                    DateTimeOffset.UtcNow,
+                                    $"capture failed: {exception.Message}"));
+                            }
+
+                            try
+                            {
+                                if (!await timer.WaitForNextTickAsync(ct))
+                                {
+                                    break;
+                                }
+                            }
+                            catch (OperationCanceledException)
+                            {
                                 break;
                             }
                         }
-                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    }
+                    finally
+                    {
+                        lock (_gate)
                         {
-                            break;
-                        }
-                        catch (Exception exception)
-                        {
-                            // 单轮失败不终止会话：记 SampleGap 继续下一轮（§37）。
-                            ExceptionLogWriter.Write(exception, "Telemetry/recorder capture");
-                            _session!.AddEvent(TelemetrySessionEvent.Simple(
-                                TelemetrySessionEventType.SampleGap,
-                                DateTimeOffset.UtcNow,
-                                $"capture failed: {exception.Message}"));
+                            if (ReferenceEquals(_loopCts, loopCts))
+                            {
+                                _loopCts = null;
+                                _loopTask = null;
+                            }
                         }
 
-                        try
-                        {
-                            if (!await timer.WaitForNextTickAsync(ct))
-                            {
-                                break;
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            break;
-                        }
+                        loopCts.Dispose();
                     }
                 }, CancellationToken.None);
 
@@ -190,12 +253,11 @@ namespace AIGeekTuner.Services.Telemetry.Recording
             Task? loop;
             lock (_gate)
             {
-                if (!IsRecording)
+                if (!IsRecording && _loopTask is null)
                 {
                     return _session;
                 }
 
-                _stopRequested = true;
                 _loopCts?.Cancel();
                 loop = _loopTask;
             }
@@ -241,14 +303,29 @@ namespace AIGeekTuner.Services.Telemetry.Recording
                 return session;
             }
 
-            var summary = TelemetrySessionAnalyzer.Analyze(session);
             var finalized = session with
             {
                 Status = status,
                 CompletedAtUtc = DateTimeOffset.UtcNow,
-                Summary = summary,
+                Summary = null,
+            };
+            // Analyze only after the immutable completed state exists so the
+            // summary duration observes the same deterministic end timestamp.
+            finalized = finalized with
+            {
+                Summary = TelemetrySessionAnalyzer.Analyze(finalized)
             };
             _session = finalized;
+            if (_liveSnapshot is not null)
+            {
+                _liveSnapshot = _liveSnapshot with
+                {
+                    Status = status,
+                    SampleCount = finalized.Samples.Count,
+                    LatestCapturedAtUtc = _latestSample?.CapturedAtUtc,
+                    Sources = GetSnapshotSources(finalized),
+                };
+            }
             return finalized;
         }
 
@@ -289,6 +366,7 @@ namespace AIGeekTuner.Services.Telemetry.Recording
 
             RecordSourceEvents(session, snapshot.Sources, completedAt);
             RecordMetricSourceEvents(session, snapshot.CanonicalReadings, completedAt);
+            session.SetLatestSources(snapshot.Sources);
 
             if (snapshot.CanonicalReadings.Count == 0)
             {
@@ -306,15 +384,71 @@ namespace AIGeekTuner.Services.Telemetry.Recording
             return sample;
         }
 
-        private void SetInitialSources(IReadOnlyList<TelemetrySourceReport> sources)
+        private void UpdateLiveSnapshotLocked(
+            TelemetryRecordingSession session,
+            TelemetrySample sample)
         {
-            lock (_gate)
+            foreach (var reading in sample.Readings)
             {
-                if (_session is not null && _session.InitialSources.Count == 0)
+                var label = TelemetryLiveMetricLabel.For(reading);
+                if (!_liveMetrics.TryGetValue(label, out var accumulator))
                 {
-                    _session = _session with { InitialSources = sources };
+                    accumulator = new LiveMetricAccumulator(reading.Unit);
+                    _liveMetrics.Add(label, accumulator);
                 }
+
+                accumulator.Add(reading.Value, sample.CapturedAtUtc);
             }
+
+            _liveSnapshot = new TelemetryRecordingSnapshot(
+                session.Id,
+                session.StartedAtUtc,
+                session.RequestedIntervalMs,
+                session.Status,
+                session.Samples.Count,
+                sample.CapturedAtUtc,
+                sample.Readings.ToImmutableArray(),
+                _liveMetrics.Select(pair => pair.Value.ToSnapshot(pair.Key)).ToImmutableArray(),
+                GetSnapshotSources(session));
+        }
+
+        private static ImmutableArray<TelemetrySourceReport> GetSnapshotSources(
+            TelemetryRecordingSession session) =>
+            (session.LatestSources.Count > 0
+                ? session.LatestSources
+                : session.InitialSources)
+            .ToImmutableArray();
+
+        private sealed class LiveMetricAccumulator
+        {
+            private double _sum;
+
+            public LiveMetricAccumulator(TelemetryUnit unit)
+            {
+                Unit = unit;
+                Minimum = double.PositiveInfinity;
+                Maximum = double.NegativeInfinity;
+            }
+
+            public TelemetryUnit Unit { get; }
+            public double Current { get; private set; }
+            public double Minimum { get; private set; }
+            public double Maximum { get; private set; }
+            public int Count { get; private set; }
+            public DateTimeOffset LastAtUtc { get; private set; }
+
+            public void Add(double value, DateTimeOffset atUtc)
+            {
+                Current = value;
+                Minimum = Math.Min(Minimum, value);
+                Maximum = Math.Max(Maximum, value);
+                _sum += value;
+                Count++;
+                LastAtUtc = atUtc;
+            }
+
+            public TelemetryLiveMetricSnapshot ToSnapshot(string label) =>
+                new(label, Unit, Current, Minimum, Maximum, _sum / Count, Count, LastAtUtc);
         }
 
         private void RecordSourceEvents(

@@ -405,16 +405,18 @@ namespace AIGeekTuner.Services.Telemetry.Aida64
             if (gpuIndex > 0)
             {
                 device = TelemetryDeviceIdentity.GpuByIndex(gpuIndex - 1, $"GPU #{gpuIndex}");
-                unit = id.EndsWith("MEM", StringComparison.OrdinalIgnoreCase)
+                // USEDDEMEM is a specific dedicated-memory sensor and must be
+                // classified before the generic *MEM temperature suffix.
+                unit = id.Contains("USEDDEMEM", StringComparison.OrdinalIgnoreCase)
+                        ? TelemetryUnit.Megabyte
+                        : id.EndsWith("MEM", StringComparison.OrdinalIgnoreCase)
                         || id.EndsWith("HOT", StringComparison.OrdinalIgnoreCase)
                     ? TelemetryUnit.Celsius
                     : id.StartsWith("TGPU", StringComparison.OrdinalIgnoreCase)
                         ? TelemetryUnit.Celsius
-                        : id.Contains("USEDDEMEM", StringComparison.OrdinalIgnoreCase)
-                            ? TelemetryUnit.Megabyte
-                            : id.EndsWith("UTI", StringComparison.OrdinalIgnoreCase)
-                                ? TelemetryUnit.Percent
-                                : TelemetryUnit.Megahertz;
+                        : id.EndsWith("UTI", StringComparison.OrdinalIgnoreCase)
+                            ? TelemetryUnit.Percent
+                            : TelemetryUnit.Megahertz;
                 return true;
             }
 

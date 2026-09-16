@@ -330,7 +330,11 @@ namespace AIGeekTuner.Services.Telemetry.HwInfo
                     HwInfoSharedMemoryLayout.StringFieldLength);
                 var nameUser = DecodeField(sensorBytes, offset + HwInfoSharedMemoryLayout.SensorNameUserOffset,
                     HwInfoSharedMemoryLayout.StringFieldLength);
-                sensors.Add(new HwInfoSensorEntry((uint)i, nameOrig.Length > 0 ? nameOrig : nameUser));
+                sensors.Add(new HwInfoSensorEntry(
+                    (uint)i,
+                    nameOrig.Length > 0 ? nameOrig : nameUser,
+                    SensorId: id,
+                    SensorInstance: instance));
                 sensorMetaByIdx.Add((id, instance));
             }
 

@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using AIGeekTuner.Models.Incidents;
 using AIGeekTuner.Services.Diagnostics;
+using AIGeekTuner.Services.Telemetry.Recording;
 
 namespace AIGeekTuner.Services.Incidents
 {
@@ -39,17 +40,18 @@ namespace AIGeekTuner.Services.Incidents
 
         public SessionIncidentStore(string sessionsDirectory)
         {
-            _rootDirectory = sessionsDirectory;
-            Directory.CreateDirectory(_rootDirectory);
+            _rootDirectory = SessionPathGuard.RequireSafeRootDirectory(sessionsDirectory);
         }
 
         public string PathOf(string sessionId) =>
-            Path.Combine(_rootDirectory, sessionId, "incidents.json");
+            Path.Combine(
+                SessionPathGuard.RequireSessionDirectory(_rootDirectory, sessionId),
+                "incidents.json");
 
         public string Save(SessionIncidentEnvelope envelope)
         {
             ArgumentNullException.ThrowIfNull(envelope);
-            var directory = Path.Combine(_rootDirectory, envelope.SessionId);
+            var directory = SessionPathGuard.RequireSessionDirectory(_rootDirectory, envelope.SessionId);
             Directory.CreateDirectory(directory);
             var finalPath = Path.Combine(directory, "incidents.json");
             var tempPath = finalPath + ".tmp";
@@ -61,8 +63,12 @@ namespace AIGeekTuner.Services.Incidents
 
         public SessionIncidentEnvelope? Load(string sessionId)
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
-            var file = PathOf(sessionId);
+            if (!SessionPathGuard.TryGetSessionDirectory(_rootDirectory, sessionId, out var directory))
+            {
+                return null;
+            }
+
+            var file = Path.Combine(directory, "incidents.json");
             if (!File.Exists(file))
             {
                 return null;
@@ -70,8 +76,13 @@ namespace AIGeekTuner.Services.Incidents
 
             try
             {
-                return JsonSerializer.Deserialize<SessionIncidentEnvelope>(
+                var envelope = JsonSerializer.Deserialize<SessionIncidentEnvelope>(
                     File.ReadAllText(file), SerializerOptions);
+                return envelope is not null
+                    && string.Equals(envelope.SessionId, sessionId, StringComparison.Ordinal)
+                    && string.Equals(Path.GetFileName(directory), envelope.SessionId, StringComparison.Ordinal)
+                    ? envelope
+                    : null;
             }
             catch (Exception exception)
             {

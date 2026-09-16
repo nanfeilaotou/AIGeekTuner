@@ -94,6 +94,10 @@ namespace AIGeekTuner.Models.Sessions
         TelemetrySessionSummary? Summary,
         IReadOnlyList<TelemetrySourceReport> InitialSources)
     {
+        /// <summary>录制结束时最后一次已知来源状态；旧文件缺失时为空。</summary>
+        public IReadOnlyList<TelemetrySourceReport> LatestSources { get; init; } =
+            Array.Empty<TelemetrySourceReport>();
+
         /// <summary>录制期间向会话追加采样（底层为可变列表，序列化只读）。</summary>
         public void AddSample(TelemetrySample sample)
         {
@@ -119,6 +123,15 @@ namespace AIGeekTuner.Models.Sessions
             }
         }
 
+        public void SetLatestSources(IReadOnlyList<TelemetrySourceReport> sources)
+        {
+            if (LatestSources is List<TelemetrySourceReport> list)
+            {
+                list.Clear();
+                list.AddRange(sources);
+            }
+        }
+
         public static TelemetryRecordingSession Start(int intervalMs, DateTimeOffset startedAtUtc) =>
             new(
                 Guid.NewGuid().ToString("N"),
@@ -129,6 +142,9 @@ namespace AIGeekTuner.Models.Sessions
                 new List<TelemetrySample>(),
                 new List<TelemetrySessionEvent>(),
                 null,
-                new List<TelemetrySourceReport>());
+                new List<TelemetrySourceReport>())
+            {
+                LatestSources = new List<TelemetrySourceReport>()
+            };
     }
 }

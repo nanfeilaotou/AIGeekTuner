@@ -13,7 +13,7 @@ namespace AIGeekTuner.Services.AI.Providers.Credentials
     /// 明文只在 protect/unprotect 的调用栈里存在，磁盘上只有 DPAPI blob。
     /// 写入走 tmp+move 原子替换；损坏的 blob / 文件按“不可用”处理并留痕，不影响启动。
     /// </summary>
-    public sealed class WindowsDpapiCredentialStore : IAiCredentialStore
+    public sealed class WindowsDpapiCredentialStore : IAiCredentialStore, IAiCredentialOriginStore
     {
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -34,6 +34,25 @@ namespace AIGeekTuner.Services.AI.Providers.Credentials
         public string FilePath => _filePath;
 
         public async Task SaveAsync(string providerId, string plainTextSecret, CancellationToken cancellationToken = default)
+        {
+            await SaveAsync(providerId, plainTextSecret, origin: null, cancellationToken, preserveExistingOrigin: true);
+        }
+
+        public async Task SaveAsync(
+            string providerId,
+            string plainTextSecret,
+            string? origin,
+            CancellationToken cancellationToken = default)
+        {
+            await SaveAsync(providerId, plainTextSecret, origin, cancellationToken, preserveExistingOrigin: false);
+        }
+
+        private async Task SaveAsync(
+            string providerId,
+            string plainTextSecret,
+            string? origin,
+            CancellationToken cancellationToken,
+            bool preserveExistingOrigin)
         {
             if (string.IsNullOrWhiteSpace(providerId))
             {
@@ -62,12 +81,17 @@ namespace AIGeekTuner.Services.AI.Providers.Credentials
                     document.Credentials.Add(new AiCredentialFileEntry
                     {
                         ProviderId = providerId,
-                        ProtectedBlobBase64 = protectedBlob
+                        ProtectedBlobBase64 = protectedBlob,
+                        Origin = origin
                     });
                 }
                 else
                 {
                     entry.ProtectedBlobBase64 = protectedBlob;
+                    if (!preserveExistingOrigin)
+                    {
+                        entry.Origin = origin;
+                    }
                 }
 
                 await WriteAtomicallyAsync(document, cancellationToken);
@@ -113,6 +137,20 @@ namespace AIGeekTuner.Services.AI.Providers.Credentials
                     "AI credential load");
                 return null;
             }
+        }
+
+        public async Task<string?> LoadOriginAsync(
+            string providerId,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(providerId))
+            {
+                return null;
+            }
+
+            var document = await LoadDocumentAsync(cancellationToken);
+            return document.Credentials.FirstOrDefault(entry =>
+                string.Equals(entry.ProviderId, providerId, StringComparison.Ordinal))?.Origin;
         }
 
         public async Task DeleteAsync(string providerId, CancellationToken cancellationToken = default)
